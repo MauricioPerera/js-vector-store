@@ -415,6 +415,11 @@ class SortedIndex {
 // CURSOR (lazy query builder)
 // ---------------------------------------------------------------------------
 
+/** Fast clone — structuredClone if available, fallback to JSON round-trip. */
+const _clone = typeof structuredClone === 'function'
+  ? (obj) => structuredClone(obj)
+  : (obj) => JSON.parse(JSON.stringify(obj));
+
 class Cursor {
   constructor(collection, filter) {
     this._col    = collection;
@@ -431,9 +436,32 @@ class Cursor {
   project(spec) { this._proj  = spec; return this; }
 
   toArray() {
-    let docs = this._col._findDocs(this._filter);
+    // OPT: Try SortedIndex-driven scan when sorting on a single indexed field
+    let docs;
+    if (this._sort && !this._proj) {
+      const sortFields = Object.entries(this._sort);
+      if (sortFields.length === 1) {
+        const [sortField, sortDir] = sortFields[0];
+        const index = this._col._indexes.get(sortField);
+        if (index instanceof SortedIndex) {
+          // Use index order — avoids in-memory sort entirely
+          const orderedIds = index.all(sortDir > 0);
+          docs = [];
+          for (const id of orderedIds) {
+            const doc = this._col._docs.get(id);
+            if (doc && matchFilter(doc, this._filter)) docs.push(doc);
+          }
+          // Skip + Limit (before clone for perf)
+          if (this._skip > 0) docs = docs.slice(this._skip);
+          if (this._limit > 0) docs = docs.slice(0, this._limit);
+          return docs.map(_clone);
+        }
+      }
+    }
 
-    // Sort
+    // Standard path: find + sort in memory (raw refs, no clone yet)
+    docs = this._col._findRaw(this._filter);
+
     if (this._sort) {
       const fields = Object.entries(this._sort);
       docs.sort((a, b) => {
@@ -447,42 +475,45 @@ class Cursor {
       });
     }
 
-    // Skip
+    // OPT: skip + limit BEFORE clone — only clone what we return
     if (this._skip > 0) docs = docs.slice(this._skip);
-
-    // Limit
     if (this._limit > 0) docs = docs.slice(0, this._limit);
 
-    // Project
+    // Project (clone inside)
     if (this._proj) {
       const includeMode = Object.values(this._proj).some(v => v === 1);
-      docs = docs.map(doc => {
-        const result = { _id: doc._id };
+      return docs.map(doc => {
         if (includeMode) {
+          const result = { _id: doc._id };
           for (const [k, v] of Object.entries(this._proj)) {
-            if (v === 1) result[k] = _getNestedValue(doc, k);
+            if (v === 1) {
+              const val = _getNestedValue(doc, k);
+              result[k] = typeof val === 'object' && val !== null ? _clone(val) : val;
+            }
           }
+          return result;
         } else {
-          Object.assign(result, JSON.parse(JSON.stringify(doc)));
+          const cloned = _clone(doc);
           for (const [k, v] of Object.entries(this._proj)) {
-            if (v === 0) delete result[k];
+            if (v === 0) delete cloned[k];
           }
+          return cloned;
         }
-        return result;
       });
     }
 
-    return docs;
+    // Clone only the final slice
+    return docs.map(_clone);
   }
 
   first() {
-    this._limit = 1;
-    const arr = this.toArray();
-    return arr.length > 0 ? arr[0] : null;
+    // OPT: early exit — don't find all, stop at first match
+    const doc = this._col._findOneRaw(this._filter);
+    return doc ? _clone(doc) : null;
   }
 
   count() {
-    return this._col._findDocs(this._filter).length;
+    return this._col._countMatching(this._filter);
   }
 
   forEach(fn) {
@@ -719,6 +750,7 @@ class Collection {
     this._indexes = new Map(); // fieldName → HashIndex | SortedIndex
     this._indexDefs = [];   // [{ field, type, unique }]
     this._dirty   = false;
+    this._dirtyIds = new Set(); // OPT-3: track modified doc IDs
     this._loaded  = false;
   }
 
@@ -806,7 +838,7 @@ class Collection {
 
   insert(doc) {
     this._ensureLoaded();
-    const newDoc = JSON.parse(JSON.stringify(doc));
+    const newDoc = _clone(doc);
     if (!newDoc._id) newDoc._id = generateId();
     if (this._docs.has(newDoc._id)) {
       throw new Error(`Duplicate _id: ${newDoc._id}`);
@@ -825,7 +857,8 @@ class Collection {
     this._docs.set(newDoc._id, newDoc);
     for (const [, index] of this._indexes) index.add(newDoc);
     this._dirty = true;
-    return newDoc;
+    this._dirtyIds.add(newDoc._id);
+    return _clone(newDoc);
   }
 
   insertMany(docs) {
@@ -837,25 +870,13 @@ class Collection {
   findById(id) {
     this._ensureLoaded();
     const doc = this._docs.get(id);
-    return doc ? JSON.parse(JSON.stringify(doc)) : null;
+    return doc ? _clone(doc) : null;
   }
 
   findOne(filter) {
     this._ensureLoaded();
-    // Try index lookup for simple equality
-    const indexResult = this._tryIndexLookup(filter);
-    if (indexResult !== null) {
-      for (const id of indexResult) {
-        const doc = this._docs.get(id);
-        if (doc && matchFilter(doc, filter)) return JSON.parse(JSON.stringify(doc));
-      }
-      return null;
-    }
-
-    for (const doc of this._docs.values()) {
-      if (matchFilter(doc, filter)) return JSON.parse(JSON.stringify(doc));
-    }
-    return null;
+    const doc = this._findOneRaw(filter);
+    return doc ? _clone(doc) : null;
   }
 
   find(filter = {}) {
@@ -863,27 +884,64 @@ class Collection {
     return new Cursor(this, filter);
   }
 
-  /** Internal: retorna docs que matchean el filtro (usado por Cursor). */
-  _findDocs(filter) {
-    this._ensureLoaded();
+  /** Internal: retorna primer doc raw (sin clone) que matchea. */
+  _findOneRaw(filter) {
+    const indexResult = this._tryIndexLookup(filter);
+    if (indexResult !== null) {
+      for (const id of indexResult) {
+        const doc = this._docs.get(id);
+        if (doc && matchFilter(doc, filter)) return doc;
+      }
+      return null;
+    }
+    for (const doc of this._docs.values()) {
+      if (matchFilter(doc, filter)) return doc;
+    }
+    return null;
+  }
 
-    // Try index acceleration
+  /** Internal: retorna docs raw (sin clone) que matchean. Usado por Cursor. */
+  _findRaw(filter) {
+    this._ensureLoaded();
     const indexResult = this._tryIndexLookup(filter);
     if (indexResult !== null) {
       const docs = [];
       for (const id of indexResult) {
         const doc = this._docs.get(id);
-        if (doc && matchFilter(doc, filter)) docs.push(JSON.parse(JSON.stringify(doc)));
+        if (doc && matchFilter(doc, filter)) docs.push(doc);
       }
       return docs;
     }
-
-    // Full scan
     const docs = [];
     for (const doc of this._docs.values()) {
-      if (matchFilter(doc, filter)) docs.push(JSON.parse(JSON.stringify(doc)));
+      if (matchFilter(doc, filter)) docs.push(doc);
     }
     return docs;
+  }
+
+  /** Internal: cuenta docs sin allocar array. */
+  _countMatching(filter) {
+    this._ensureLoaded();
+    if (!filter || Object.keys(filter).length === 0) return this._docs.size;
+    const indexResult = this._tryIndexLookup(filter);
+    if (indexResult !== null) {
+      let count = 0;
+      for (const id of indexResult) {
+        const doc = this._docs.get(id);
+        if (doc && matchFilter(doc, filter)) count++;
+      }
+      return count;
+    }
+    let count = 0;
+    for (const doc of this._docs.values()) {
+      if (matchFilter(doc, filter)) count++;
+    }
+    return count;
+  }
+
+  /** Backward compat: cloned version of _findRaw. */
+  _findDocs(filter) {
+    return this._findRaw(filter).map(_clone);
   }
 
   /** Intenta usar un indice para acelerar el filtro. Retorna null si no puede. */
@@ -937,14 +995,14 @@ class Collection {
 
   update(filter, update) {
     this._ensureLoaded();
-    const doc = this.findOne(filter);
+    const doc = this._findOneRaw(filter);
     if (!doc) return 0;
     return this._updateDoc(doc._id, update);
   }
 
   updateMany(filter, update) {
     this._ensureLoaded();
-    const docs = this._findDocs(filter);
+    const docs = this._findRaw(filter);
     let count = 0;
     for (const doc of docs) {
       count += this._updateDoc(doc._id, update);
@@ -957,17 +1015,14 @@ class Collection {
     if (!oldDoc) return 0;
 
     const newDoc = applyUpdate(oldDoc, update);
-    newDoc._id = id; // preserve _id
+    newDoc._id = id;
 
-    // Remove from indexes, re-add
     for (const [, index] of this._indexes) index.remove(oldDoc);
 
-    // Check unique constraints
     for (const [, index] of this._indexes) {
       if (index instanceof HashIndex && index.unique) {
         const val = _getNestedValue(newDoc, index.field);
         if (val !== undefined && index.has(val)) {
-          // Revert: re-add old doc to indexes
           for (const [, idx] of this._indexes) idx.add(oldDoc);
           throw new Error(`Unique constraint violated: ${index.field} = "${val}"`);
         }
@@ -977,19 +1032,20 @@ class Collection {
     this._docs.set(id, newDoc);
     for (const [, index] of this._indexes) index.add(newDoc);
     this._dirty = true;
+    this._dirtyIds.add(id);
     return 1;
   }
 
   remove(filter) {
     this._ensureLoaded();
-    const doc = this.findOne(filter);
+    const doc = this._findOneRaw(filter);
     if (!doc) return 0;
     return this._removeDoc(doc._id);
   }
 
   removeMany(filter) {
     this._ensureLoaded();
-    const docs = this._findDocs(filter);
+    const docs = this._findRaw(filter);
     let count = 0;
     for (const doc of docs) count += this._removeDoc(doc._id);
     return count;
@@ -1006,13 +1062,13 @@ class Collection {
     for (const [, index] of this._indexes) index.remove(doc);
     this._docs.delete(id);
     this._dirty = true;
+    this._dirtyIds.add(id); // track deletion
     return 1;
   }
 
   count(filter) {
     this._ensureLoaded();
-    if (!filter) return this._docs.size;
-    return this._findDocs(filter).length;
+    return this._countMatching(filter || {});
   }
 
   // ── Aggregation ──────────────────────────────────────────
@@ -1034,13 +1090,16 @@ class Collection {
     // Save metadata
     this._adapter.writeJson(this._metaFile(), { indexes: this._indexDefs });
 
-    // Save indexes
-    for (const [field, index] of this._indexes) {
-      const type = index instanceof SortedIndex ? 'sorted' : 'hash';
-      this._adapter.writeJson(this._indexFile(field, type), index.exportState());
+    // Save indexes (only if docs changed)
+    if (this._dirtyIds.size > 0) {
+      for (const [field, index] of this._indexes) {
+        const type = index instanceof SortedIndex ? 'sorted' : 'hash';
+        this._adapter.writeJson(this._indexFile(field, type), index.exportState());
+      }
     }
 
     this._dirty = false;
+    this._dirtyIds.clear();
   }
 
   clear() {
@@ -1048,12 +1107,13 @@ class Collection {
     this._docs.clear();
     for (const [, index] of this._indexes) index.clear();
     this._dirty = true;
+    this._dirtyIds.clear();
   }
 
   /** Exporta todos los documentos como array. */
   export() {
     this._ensureLoaded();
-    return Array.from(this._docs.values()).map(d => JSON.parse(JSON.stringify(d)));
+    return Array.from(this._docs.values()).map(_clone);
   }
 
   /** Importa documentos (merge). */
