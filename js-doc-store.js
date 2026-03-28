@@ -539,6 +539,28 @@ class AggregationPipeline {
     return this;
   }
 
+  /**
+   * Lookup: join con otra coleccion (equivalente a SQL LEFT JOIN / MongoDB $lookup).
+   *
+   * @param {object} opts
+   * @param {string} opts.from         Nombre de la coleccion a unir
+   * @param {string} opts.localField   Campo en los docs actuales
+   * @param {string} opts.foreignField Campo en la coleccion foreign
+   * @param {string} opts.as           Nombre del campo donde poner los resultados
+   * @param {object} [opts.filter]     Filtro adicional sobre los docs foreign
+   * @param {boolean} [opts.single]    Si true, pone un objeto en vez de array (como INNER JOIN first match)
+   *
+   * Ejemplo:
+   *   orders.aggregate()
+   *     .lookup({ from: 'users', localField: 'userId', foreignField: '_id', as: 'user', single: true })
+   *     .toArray();
+   *   // Cada order tendra order.user = { _id, name, email, ... }
+   */
+  lookup(opts) {
+    this._stages.push({ type: 'lookup', ...opts });
+    return this;
+  }
+
   toArray() {
     let docs = this._col._findDocs({});
 
@@ -642,6 +664,41 @@ class AggregationPipeline {
           docs = newDocs;
           break;
         }
+
+        case 'lookup': {
+          const store = this._col._store;
+          if (!store) throw new Error('lookup requires DocStore reference (use db.collection())');
+          const foreignCol = store.collection(stage.from);
+          foreignCol._ensureLoaded();
+
+          // Pre-build index de foreign docs por foreignField para O(1) lookup
+          const foreignIdx = new Map(); // value → [doc, ...]
+          for (const fDoc of foreignCol._docs.values()) {
+            const fVal = _getNestedValue(fDoc, stage.foreignField);
+            if (fVal === undefined) continue;
+            const key = String(fVal);
+            if (!foreignIdx.has(key)) foreignIdx.set(key, []);
+            foreignIdx.get(key).push(fDoc);
+          }
+
+          for (const doc of docs) {
+            const localVal = _getNestedValue(doc, stage.localField);
+            if (localVal === undefined) { doc[stage.as] = stage.single ? null : []; continue; }
+
+            let matches = foreignIdx.get(String(localVal)) || [];
+
+            // Filtro adicional
+            if (stage.filter) {
+              matches = matches.filter(m => matchFilter(m, stage.filter));
+            }
+
+            // Deep copy
+            const copied = matches.map(m => JSON.parse(JSON.stringify(m)));
+
+            doc[stage.as] = stage.single ? (copied[0] || null) : copied;
+          }
+          break;
+        }
       }
     }
 
@@ -654,9 +711,10 @@ class AggregationPipeline {
 // ---------------------------------------------------------------------------
 
 class Collection {
-  constructor(name, adapter) {
+  constructor(name, adapter, store = null) {
     this.name     = name;
     this._adapter = adapter;
+    this._store   = store;  // referencia al DocStore padre (para lookups)
     this._docs    = null;   // Map<_id, doc>
     this._indexes = new Map(); // fieldName → HashIndex | SortedIndex
     this._indexDefs = [];   // [{ field, type, unique }]
@@ -1027,7 +1085,7 @@ class DocStore {
 
   collection(name) {
     if (!this._collections.has(name)) {
-      this._collections.set(name, new Collection(name, this._adapter));
+      this._collections.set(name, new Collection(name, this._adapter, this));
     }
     return this._collections.get(name);
   }
