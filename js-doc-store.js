@@ -1175,6 +1175,370 @@ class DocStore {
 }
 
 // ---------------------------------------------------------------------------
+// SCHEMA (column types + validation + templates)
+// ---------------------------------------------------------------------------
+// Define colecciones con columnas tipadas, validacion, defaults, y opciones.
+// Uso:
+//   const table = new Table(db, 'contacts', {
+//     columns: [
+//       { name: 'Name', type: 'text', required: true },
+//       { name: 'Email', type: 'email', unique: true },
+//       { name: 'Status', type: 'select', options: ['Lead', 'Active'] },
+//     ]
+//   });
+
+const _EMAIL_RE = /^[^\s@]+@[^\s@]+\.[^\s@]+$/;
+const _URL_RE   = /^https?:\/\/.+/;
+const _PHONE_RE = /^[\d\s\+\-\(\)\.]+$/;
+
+const COLUMN_VALIDATORS = {
+  text:        (v) => typeof v === 'string',
+  number:      (v) => typeof v === 'number' && !isNaN(v),
+  checkbox:    (v) => typeof v === 'boolean',
+  date:        (v) => typeof v === 'string' || typeof v === 'number' || v instanceof Date,
+  email:       (v) => typeof v === 'string' && _EMAIL_RE.test(v),
+  url:         (v) => typeof v === 'string' && _URL_RE.test(v),
+  phone:       (v) => typeof v === 'string' && _PHONE_RE.test(v),
+  select:      (v, col) => col.options ? col.options.includes(v) : typeof v === 'string',
+  multiselect: (v, col) => Array.isArray(v) && (!col.options || v.every(x => col.options.includes(x))),
+  relation:    (v) => typeof v === 'string', // _id de otro doc
+  json:        (_v) => true, // cualquier cosa
+  attachment:  (v) => typeof v === 'string' || (typeof v === 'object' && v !== null), // URL o metadata
+  formula:     (_v) => true, // computed, no se valida en insert
+  autonumber:  (_v) => true, // auto-generated
+};
+
+class Table {
+  /**
+   * @param {DocStore} db
+   * @param {string} name
+   * @param {object} schema
+   * @param {Array<{name, type, required?, unique?, options?, default?, collection?}>} schema.columns
+   */
+  constructor(db, name, schema = {}) {
+    this.db       = db;
+    this.name     = name;
+    this.columns  = schema.columns || [];
+    this._col     = db.collection(name);
+    this._views   = new Map();
+    this._autoNum = 0;
+
+    // Build column map for fast lookup
+    this._colMap = new Map();
+    for (const col of this.columns) {
+      this._colMap.set(col.name, col);
+    }
+
+    // Create indexes for unique columns
+    const existingIndexes = new Set(this._col.getIndexes().map(i => i.field));
+    for (const col of this.columns) {
+      if (col.unique && !existingIndexes.has(col.name)) {
+        this._col.createIndex(col.name, { unique: true });
+      }
+    }
+
+    // Load saved views
+    this._loadViews();
+
+    // Load autonumber counter
+    this._loadAutoNum();
+  }
+
+  // ── Validation ──────────────────────────────────────────
+
+  _validate(doc, isUpdate = false) {
+    const errors = [];
+
+    for (const col of this.columns) {
+      const val = doc[col.name];
+
+      // Required check (skip on update if field not present)
+      if (col.required && !isUpdate && (val === undefined || val === null || val === '')) {
+        errors.push(`${col.name} is required`);
+        continue;
+      }
+
+      // Skip if not present (optional field)
+      if (val === undefined || val === null) continue;
+
+      // Skip auto-generated
+      if (col.type === 'autonumber' || col.type === 'formula') continue;
+
+      // Type validation
+      const validator = COLUMN_VALIDATORS[col.type];
+      if (validator && !validator(val, col)) {
+        errors.push(`${col.name}: invalid ${col.type} value`);
+      }
+    }
+
+    if (errors.length > 0) {
+      throw new Error(`Validation failed: ${errors.join('; ')}`);
+    }
+  }
+
+  _applyDefaults(doc) {
+    const result = { ...doc };
+
+    for (const col of this.columns) {
+      if (result[col.name] !== undefined) continue;
+
+      if (col.type === 'autonumber') {
+        this._autoNum++;
+        result[col.name] = this._autoNum;
+        continue;
+      }
+
+      if (col.default !== undefined) {
+        result[col.name] = typeof col.default === 'function' ? col.default() : col.default;
+      }
+    }
+
+    return result;
+  }
+
+  // ── CRUD (validated) ────────────────────────────────────
+
+  insert(doc) {
+    const withDefaults = this._applyDefaults(doc);
+    this._validate(withDefaults);
+    return this._col.insert(withDefaults);
+  }
+
+  insertMany(docs) {
+    return docs.map(d => this.insert(d));
+  }
+
+  update(filter, update) {
+    // Validate $set values if present
+    if (update.$set) {
+      this._validate(update.$set, true);
+    }
+    return this._col.update(filter, update);
+  }
+
+  updateMany(filter, update) {
+    if (update.$set) {
+      this._validate(update.$set, true);
+    }
+    return this._col.updateMany(filter, update);
+  }
+
+  // Delegate read ops directly
+  find(filter)     { return this._col.find(filter); }
+  findOne(filter)  { return this._col.findOne(filter); }
+  findById(id)     { return this._col.findById(id); }
+  remove(filter)   { return this._col.remove(filter); }
+  removeMany(f)    { return this._col.removeMany(f); }
+  count(filter)    { return this._col.count(filter); }
+  aggregate()      { return this._col.aggregate(); }
+  export()         { return this._col.export(); }
+
+  // ── Views (saved queries) ──────────────────────────────
+
+  /**
+   * Crea una vista con nombre (query guardada).
+   * @param {string} viewName
+   * @param {object} opts
+   * @param {object} opts.filter    Filtro
+   * @param {object} [opts.sort]    Sort spec
+   * @param {number} [opts.limit]   Limit
+   * @param {object} [opts.project] Projection
+   */
+  createView(viewName, opts) {
+    this._views.set(viewName, opts);
+    this._saveViews();
+  }
+
+  dropView(viewName) {
+    this._views.delete(viewName);
+    this._saveViews();
+  }
+
+  listViews() {
+    return Array.from(this._views.keys());
+  }
+
+  getView(viewName) {
+    return this._views.get(viewName) || null;
+  }
+
+  /**
+   * Ejecuta una vista.
+   * @returns {Array} Resultados
+   */
+  view(viewName) {
+    const v = this._views.get(viewName);
+    if (!v) throw new Error(`View not found: ${viewName}`);
+
+    let cursor = this._col.find(v.filter || {});
+    if (v.sort) cursor = cursor.sort(v.sort);
+    if (v.skip) cursor = cursor.skip(v.skip);
+    if (v.limit) cursor = cursor.limit(v.limit);
+    if (v.project) cursor = cursor.project(v.project);
+    return cursor.toArray();
+  }
+
+  // ── Schema info ────────────────────────────────────────
+
+  getSchema() {
+    return {
+      name: this.name,
+      columns: this.columns.map(c => ({ ...c })),
+    };
+  }
+
+  addColumn(colDef) {
+    if (this._colMap.has(colDef.name)) throw new Error(`Column exists: ${colDef.name}`);
+    this.columns.push(colDef);
+    this._colMap.set(colDef.name, colDef);
+    if (colDef.unique) {
+      try { this._col.createIndex(colDef.name, { unique: true }); } catch {}
+    }
+    this._saveMeta();
+  }
+
+  removeColumn(name) {
+    this.columns = this.columns.filter(c => c.name !== name);
+    this._colMap.delete(name);
+    try { this._col.dropIndex(name); } catch {}
+    this._saveMeta();
+  }
+
+  renameColumn(oldName, newName) {
+    const col = this._colMap.get(oldName);
+    if (!col) throw new Error(`Column not found: ${oldName}`);
+    col.name = newName;
+    this._colMap.delete(oldName);
+    this._colMap.set(newName, col);
+    // Rename field in all docs
+    this._col.updateMany({}, { $rename: { [oldName]: newName } });
+    this._saveMeta();
+  }
+
+  // ── Relation helpers ───────────────────────────────────
+
+  /**
+   * Expande relaciones: reemplaza IDs con docs de la coleccion relacionada.
+   */
+  expandRelations(doc) {
+    if (!doc) return doc;
+    const result = { ...doc };
+    for (const col of this.columns) {
+      if (col.type === 'relation' && col.collection && result[col.name]) {
+        const relCol = this.db.collection(col.collection);
+        result[col.name] = relCol.findById(result[col.name]);
+      }
+    }
+    return result;
+  }
+
+  // ── Persistence helpers ─────────────────────────────────
+
+  _saveMeta() {
+    this.db._adapter.writeJson(`${this.name}.schema.json`, {
+      columns: this.columns,
+      autoNum: this._autoNum,
+    });
+  }
+
+  _loadAutoNum() {
+    const meta = this.db._adapter.readJson(`${this.name}.schema.json`);
+    if (meta && meta.autoNum) this._autoNum = meta.autoNum;
+  }
+
+  _saveViews() {
+    const views = {};
+    for (const [name, opts] of this._views) views[name] = opts;
+    this.db._adapter.writeJson(`${this.name}.views.json`, views);
+  }
+
+  _loadViews() {
+    const views = this.db._adapter.readJson(`${this.name}.views.json`);
+    if (views) {
+      for (const [name, opts] of Object.entries(views)) {
+        this._views.set(name, opts);
+      }
+    }
+  }
+
+  flush() {
+    this._col.flush();
+    this._saveMeta();
+    this._saveViews();
+  }
+}
+
+// ── Templates (pre-built schemas) ────────────────────────
+
+const TEMPLATES = {
+  crm: {
+    columns: [
+      { name: 'Name',     type: 'text',     required: true },
+      { name: 'Email',    type: 'email',    unique: true },
+      { name: 'Phone',    type: 'phone' },
+      { name: 'Company',  type: 'text' },
+      { name: 'Status',   type: 'select',   options: ['Lead', 'Qualified', 'Active', 'Churned'], default: 'Lead' },
+      { name: 'Revenue',  type: 'number',   default: 0 },
+      { name: 'Notes',    type: 'text' },
+      { name: 'Tags',     type: 'multiselect', options: ['VIP', 'Enterprise', 'SMB', 'Partner'] },
+      { name: 'CreatedAt',type: 'date',     default: () => new Date().toISOString() },
+    ],
+  },
+  tasks: {
+    columns: [
+      { name: 'Title',    type: 'text',     required: true },
+      { name: 'Description', type: 'text' },
+      { name: 'Status',   type: 'select',   options: ['Todo', 'In Progress', 'Done', 'Blocked'], default: 'Todo' },
+      { name: 'Priority', type: 'select',   options: ['Low', 'Medium', 'High', 'Urgent'], default: 'Medium' },
+      { name: 'Assignee', type: 'text' },
+      { name: 'DueDate',  type: 'date' },
+      { name: 'Tags',     type: 'multiselect', options: ['Bug', 'Feature', 'Docs', 'Infra'] },
+      { name: 'Number',   type: 'autonumber' },
+      { name: 'CreatedAt',type: 'date',     default: () => new Date().toISOString() },
+    ],
+  },
+  inventory: {
+    columns: [
+      { name: 'SKU',      type: 'text',     required: true, unique: true },
+      { name: 'Name',     type: 'text',     required: true },
+      { name: 'Category', type: 'select',   options: ['Electronics', 'Clothing', 'Food', 'Tools', 'Other'] },
+      { name: 'Price',    type: 'number',   required: true },
+      { name: 'Stock',    type: 'number',   default: 0 },
+      { name: 'Active',   type: 'checkbox', default: true },
+      { name: 'ImageURL', type: 'url' },
+      { name: 'Number',   type: 'autonumber' },
+    ],
+  },
+  content: {
+    columns: [
+      { name: 'Title',    type: 'text',     required: true },
+      { name: 'Body',     type: 'text' },
+      { name: 'Author',   type: 'text' },
+      { name: 'Status',   type: 'select',   options: ['Draft', 'Review', 'Published', 'Archived'], default: 'Draft' },
+      { name: 'Category', type: 'select',   options: ['Blog', 'Tutorial', 'News', 'Docs'] },
+      { name: 'Tags',     type: 'multiselect' },
+      { name: 'PublishedAt', type: 'date' },
+      { name: 'URL',      type: 'url' },
+      { name: 'Number',   type: 'autonumber' },
+      { name: 'CreatedAt',type: 'date',     default: () => new Date().toISOString() },
+    ],
+  },
+};
+
+/**
+ * Crea una Table desde un template predefinido.
+ * @param {DocStore} db
+ * @param {string} name      Nombre de la coleccion
+ * @param {string} template  'crm' | 'tasks' | 'inventory' | 'content'
+ * @returns {Table}
+ */
+function createFromTemplate(db, name, template) {
+  const schema = TEMPLATES[template];
+  if (!schema) throw new Error(`Unknown template: ${template}. Available: ${Object.keys(TEMPLATES).join(', ')}`);
+  return new Table(db, name, schema);
+}
+
+// ---------------------------------------------------------------------------
 // ENCRYPTED ADAPTER (AES-256-GCM, zero deps — usa Web Crypto API)
 // ---------------------------------------------------------------------------
 // Wrapper sobre cualquier adapter. Encripta JSON antes de escribir,
@@ -1823,6 +2187,9 @@ module.exports = {
   AggregationPipeline,
   HashIndex,
   SortedIndex,
+  Table,
+  TEMPLATES,
+  createFromTemplate,
   FileStorageAdapter,
   MemoryStorageAdapter,
   CloudflareKVAdapter,

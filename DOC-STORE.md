@@ -466,6 +466,121 @@ Resultados en Node.js, N=10,000 documentos:
 
 **Recomendacion**: js-doc-store para < 100K docs con portabilidad, encriptacion, o auth integrado. D1 para datasets grandes con SQL complejo.
 
+## Tables (schema + validation + views)
+
+Capa estilo Airtable sobre DocStore: columnas tipadas, validacion, defaults, autonumber, vistas guardadas, y templates.
+
+### Definir un schema
+
+```js
+const { DocStore, MemoryStorageAdapter, Table } = require('./js-doc-store');
+
+const db = new DocStore(new MemoryStorageAdapter());
+
+const contacts = new Table(db, 'contacts', {
+  columns: [
+    { name: 'Name',    type: 'text',     required: true },
+    { name: 'Email',   type: 'email',    unique: true },
+    { name: 'Phone',   type: 'phone' },
+    { name: 'Age',     type: 'number' },
+    { name: 'Active',  type: 'checkbox', default: true },
+    { name: 'Status',  type: 'select',   options: ['Lead', 'Active', 'Churned'] },
+    { name: 'Tags',    type: 'multiselect', options: ['VIP', 'Enterprise', 'SMB'] },
+    { name: 'Website', type: 'url' },
+    { name: 'Company', type: 'relation', collection: 'companies' },
+    { name: 'Number',  type: 'autonumber' },
+  ]
+});
+
+// Insert valida tipos, required, opciones, y unicidad
+contacts.insert({ Name: 'Alice', Email: 'alice@test.com', Status: 'Lead' });
+// → { _id: '...', Name: 'Alice', Active: true, Number: 1, ... }
+```
+
+### Tipos de columna
+
+| Tipo | Validacion | Ejemplo |
+|---|---|---|
+| `text` | string | `'Hello'` |
+| `number` | number, no NaN | `42` |
+| `checkbox` | boolean | `true` |
+| `date` | string, number, o Date | `'2024-01-15'` |
+| `email` | formato email | `'alice@test.com'` |
+| `url` | comienza con http(s):// | `'https://example.com'` |
+| `phone` | digitos, espacios, +, -, () | `'+1 555-1234'` |
+| `select` | valor en `options[]` | `'Active'` |
+| `multiselect` | array de valores en `options[]` | `['VIP', 'Enterprise']` |
+| `relation` | _id de doc en otra coleccion | `'co-1'` |
+| `json` | cualquier valor | `{ key: 'value' }` |
+| `attachment` | string (URL) u objeto | `'https://...'` |
+| `autonumber` | auto-incrementa (1, 2, 3...) | no se pasa en insert |
+| `formula` | campo computado | no se valida |
+
+### Opciones de columna
+
+| Opcion | Efecto |
+|---|---|
+| `required: true` | No puede ser undefined/null/vacio |
+| `unique: true` | Crea indice unico automaticamente |
+| `default: value` | Valor por defecto (o funcion: `() => Date.now()`) |
+| `options: [...]` | Opciones validas para select/multiselect |
+| `collection: 'name'` | Coleccion relacionada (para type: 'relation') |
+
+### Views (queries guardadas)
+
+```js
+// Crear vista
+contacts.createView('active-vip', {
+  filter: { $and: [{ Status: 'Active' }, { Tags: { $contains: 'VIP' } }] },
+  sort: { Name: 1 },
+  limit: 50,
+});
+
+// Ejecutar vista
+const results = contacts.view('active-vip');
+
+// Gestionar vistas
+contacts.listViews();           // ['active-vip']
+contacts.getView('active-vip'); // { filter, sort, limit }
+contacts.dropView('active-vip');
+```
+
+### Schema management
+
+```js
+contacts.getSchema();                       // { name, columns: [...] }
+contacts.addColumn({ name: 'Score', type: 'number', default: 0 });
+contacts.renameColumn('Score', 'Rating');    // renombra en todos los docs
+contacts.removeColumn('Rating');
+```
+
+### Relaciones
+
+```js
+// Expandir relacion: reemplaza _id con el documento completo
+const doc = contacts.findById(id);
+const expanded = contacts.expandRelations(doc);
+// doc.Company = 'co-1' → expanded.Company = { _id: 'co-1', name: 'Acme', ... }
+```
+
+### Templates predefinidos
+
+```js
+const { createFromTemplate } = require('./js-doc-store');
+
+const crm   = createFromTemplate(db, 'my-crm', 'crm');
+const tasks = createFromTemplate(db, 'my-tasks', 'tasks');
+const inv   = createFromTemplate(db, 'my-inv', 'inventory');
+const blog  = createFromTemplate(db, 'my-blog', 'content');
+```
+
+| Template | Columnas incluidas |
+|---|---|
+| `crm` | Name, Email, Phone, Company, Status (Lead/Qualified/Active/Churned), Revenue, Notes, Tags, CreatedAt |
+| `tasks` | Title, Description, Status (Todo/In Progress/Done/Blocked), Priority (Low-Urgent), Assignee, DueDate, Tags, Number, CreatedAt |
+| `inventory` | SKU (unique), Name, Category, Price, Stock, Active, ImageURL, Number |
+| `content` | Title, Body, Author, Status (Draft/Review/Published/Archived), Category, Tags, PublishedAt, URL, Number, CreatedAt |
+
 ## Ecosistema
 
 js-doc-store es parte del ecosistema js-vector:
