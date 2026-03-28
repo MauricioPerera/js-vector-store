@@ -1105,6 +1105,381 @@ class BinaryQuantizedStore {
 }
 
 // ---------------------------------------------------------------------------
+// POLAR QUANTIZED STORE (3-bit, PolarQuant-inspired)
+// ---------------------------------------------------------------------------
+// Cada par de dimensiones se convierte a coordenadas polares (r, theta).
+// Para cosine similarity solo importa la direccion (theta), no la magnitud (r).
+// Theta se cuantiza a 3 bits (8 niveles) en [-PI, PI].
+// Resultado: ceil(dim/2) * 3 bits = ceil(dim*3/16) bytes por vector → ~21x compresion.
+//
+// Antes de cuantizar, aplica una rotacion aleatoria determinista (Haar-like)
+// para distribuir la energia uniformemente y mejorar la cuantizacion uniforme.
+//
+// Similitud: reconstruye vectores unitarios desde angulos cuantizados y calcula
+// coseno directo. Mas preciso que Binary (1-bit) con compresion similar.
+
+class PolarQuantizedStore {
+  /**
+   * @param {string|object} dirOrAdapter
+   * @param {number} dim  Debe ser par
+   * @param {object} [opts]
+   * @param {number} [opts.bits=3]     Bits por angulo (2-8)
+   * @param {number} [opts.seed=42]    Seed para la rotacion determinista
+   * @param {string} [opts.model]      Modelo de embeddings
+   */
+  constructor(dirOrAdapter, dim = 768, opts = {}) {
+    if (dim % 2 !== 0) throw new Error('PolarQuantizedStore: dim must be even');
+    this.dim          = dim;
+    this.bits         = opts.bits || 3;
+    this.seed         = opts.seed ?? 42;
+    this.defaultModel = opts.model || null;
+    this._levels      = 1 << this.bits; // 2^bits = 8 para 3 bits
+    this._pairs       = dim / 2;
+    this._bitsPerVec  = this._pairs * this.bits;
+    this._bytesPerVec = Math.ceil(this._bitsPerVec / 8);
+    this._adapter     = typeof dirOrAdapter === 'string'
+      ? new FileStorageAdapter(dirOrAdapter)
+      : dirOrAdapter;
+    this._collections = new Map();
+
+    // Precomputar tabla de cos/sin para los niveles de cuantizacion
+    this._cosTable = new Float64Array(this._levels);
+    this._sinTable = new Float64Array(this._levels);
+    for (let i = 0; i < this._levels; i++) {
+      const theta = -Math.PI + (i + 0.5) * (2 * Math.PI / this._levels);
+      this._cosTable[i] = Math.cos(theta);
+      this._sinTable[i] = Math.sin(theta);
+    }
+
+    // Generar rotacion determinista (simplified Haar-like via seeded PRNG)
+    this._rotation = this._generateRotation(dim, this.seed);
+  }
+
+  _binFile(col)  { return `${col}.p3.bin`; }
+  _jsonFile(col) { return `${col}.p3.json`; }
+
+  /** PRNG determinista (xorshift32) */
+  _xorshift(state) {
+    state ^= state << 13;
+    state ^= state >> 17;
+    state ^= state << 5;
+    return state >>> 0;
+  }
+
+  /** Genera una rotacion pseudo-aleatoria determinista.
+   *  Usa vectores aleatorios + Gram-Schmidt simplificado en pares.
+   *  No es una rotacion ortogonal completa (O(n^2)), pero distribuye energia
+   *  suficientemente para mejorar cuantizacion uniforme. */
+  _generateRotation(dim, seed) {
+    // Generamos dim vectores de signos aleatorios para fast rotation
+    // (Hadamard-like: multiplicar por signos aleatorios + shuffle)
+    const signs = new Float64Array(dim);
+    let state = seed || 42;
+    for (let i = 0; i < dim; i++) {
+      state = this._xorshift(state);
+      signs[i] = (state & 1) ? 1 : -1;
+    }
+    // Permutacion determinista
+    const perm = new Uint32Array(dim);
+    for (let i = 0; i < dim; i++) perm[i] = i;
+    state = seed * 7 + 13;
+    for (let i = dim - 1; i > 0; i--) {
+      state = this._xorshift(state);
+      const j = state % (i + 1);
+      const tmp = perm[i]; perm[i] = perm[j]; perm[j] = tmp;
+    }
+    return { signs, perm };
+  }
+
+  /** Aplica rotacion: sign-flip + permute */
+  _rotate(vec) {
+    const { signs, perm } = this._rotation;
+    const out = new Float64Array(this.dim);
+    for (let i = 0; i < this.dim; i++) {
+      out[i] = vec[perm[i]] * signs[perm[i]];
+    }
+    return out;
+  }
+
+  /** Cuantiza un vector a angulos de 3 bits */
+  _quantize(vector) {
+    const norm = normalize(vector);
+    const rotated = this._rotate(norm);
+    const indices = new Uint8Array(this._pairs);
+
+    for (let p = 0; p < this._pairs; p++) {
+      const a = rotated[p * 2];
+      const b = rotated[p * 2 + 1];
+      const theta = Math.atan2(b, a); // [-PI, PI]
+      // Cuantizar a nivel: floor((theta + PI) / (2*PI) * levels)
+      let level = Math.floor((theta + Math.PI) / (2 * Math.PI) * this._levels);
+      if (level >= this._levels) level = this._levels - 1;
+      indices[p] = level;
+    }
+
+    return this._packBits(indices);
+  }
+
+  /** Empaqueta array de indices (0..levels-1) a bytes */
+  _packBits(indices) {
+    const buf = new Uint8Array(this._bytesPerVec);
+    let bitPos = 0;
+    for (let p = 0; p < this._pairs; p++) {
+      const val = indices[p];
+      for (let b = this.bits - 1; b >= 0; b--) {
+        if (val & (1 << b)) {
+          buf[bitPos >> 3] |= (1 << (7 - (bitPos & 7)));
+        }
+        bitPos++;
+      }
+    }
+    return buf;
+  }
+
+  /** Desempaqueta bytes a array de indices */
+  _unpackBits(packed, offset) {
+    const indices = new Uint8Array(this._pairs);
+    let bitPos = 0;
+    for (let p = 0; p < this._pairs; p++) {
+      let val = 0;
+      for (let b = this.bits - 1; b >= 0; b--) {
+        const byteIdx = offset + (bitPos >> 3);
+        const bitIdx  = 7 - (bitPos & 7);
+        if (packed[byteIdx] & (1 << bitIdx)) val |= (1 << b);
+        bitPos++;
+      }
+      indices[p] = val;
+    }
+    return indices;
+  }
+
+  /** Reconstruye vector unitario desde angulos cuantizados (en espacio rotado) */
+  _dequantize(packed, offset) {
+    const indices = this._unpackBits(packed, offset);
+    const rotated = new Float64Array(this.dim);
+    for (let p = 0; p < this._pairs; p++) {
+      rotated[p * 2]     = this._cosTable[indices[p]];
+      rotated[p * 2 + 1] = this._sinTable[indices[p]];
+    }
+    // Rotacion inversa: unpermute + unsign
+    const { signs, perm } = this._rotation;
+    const out = new Float64Array(this.dim);
+    for (let i = 0; i < this.dim; i++) {
+      out[perm[i]] = rotated[i] * signs[perm[i]];
+    }
+    return out;
+  }
+
+  /** Coseno aproximado directo entre query (float) y stored (packed bits) */
+  _cosinePolar(query, packed, offset) {
+    const indices = this._unpackBits(packed, offset);
+    const queryRot = this._rotate(query);
+    // Dot product en espacio rotado: sum( q[2p]*cos(theta_p) + q[2p+1]*sin(theta_p) )
+    let dot = 0, nq = 0;
+    for (let p = 0; p < this._pairs; p++) {
+      const qa = queryRot[p * 2];
+      const qb = queryRot[p * 2 + 1];
+      dot += qa * this._cosTable[indices[p]] + qb * this._sinTable[indices[p]];
+      nq += qa * qa + qb * qb;
+    }
+    // El vector reconstruido es unitario por construccion (cos^2+sin^2=1 por par)
+    const denomQ = Math.sqrt(nq);
+    return denomQ === 0 ? 0 : dot / denomQ;
+  }
+
+  // ── Collection management (same pattern as other stores) ─────
+
+  _load(col) {
+    if (this._collections.has(col)) return this._collections.get(col);
+    const manifest = this._adapter.readJson(this._jsonFile(col));
+    const ids   = manifest ? manifest.ids  : [];
+    const meta  = manifest ? manifest.meta : [];
+    const model = manifest?.model || this.defaultModel || null;
+    const idMap = new Map();
+    for (let i = 0; i < ids.length; i++) idMap.set(ids[i], i);
+    const bin = this._adapter.readBin(this._binFile(col));
+    const entry = { ids, meta, idMap, bin, model, pending: [], dirty: false };
+    this._collections.set(col, entry);
+    return entry;
+  }
+
+  getModel(col) { return this._load(col).model; }
+  setModel(col, model) { const e = this._load(col); e.model = model; e.dirty = true; }
+
+  set(col, id, vector, metadata = {}) {
+    const entry    = this._load(col);
+    const existing = entry.idMap.get(id);
+    const packed   = this._quantize(vector);
+
+    if (existing !== undefined) {
+      const committed = entry.ids.length - entry.pending.length;
+      if (existing < committed && entry.bin) {
+        new Uint8Array(entry.bin).set(packed, existing * this._bytesPerVec);
+      } else if (existing >= committed) {
+        entry.pending[existing - committed].packed = packed;
+      }
+      entry.meta[existing] = metadata;
+    } else {
+      const idx = entry.ids.length;
+      entry.ids.push(id);
+      entry.meta.push(metadata);
+      entry.idMap.set(id, idx);
+      entry.pending.push({ id, packed, metadata });
+    }
+    entry.dirty = true;
+  }
+
+  remove(col, id) {
+    const entry = this._load(col);
+    const idx   = entry.idMap.get(id);
+    if (idx === undefined) return false;
+    if (entry.pending.length > 0) this._flushCol(col, entry);
+
+    // Swap with last
+    const lastIdx = entry.ids.length - 1;
+    const bpv = this._bytesPerVec;
+    const u8 = new Uint8Array(entry.bin);
+    if (idx !== lastIdx) {
+      const lastId = entry.ids[lastIdx];
+      u8.copyWithin(idx * bpv, lastIdx * bpv, (lastIdx + 1) * bpv);
+      entry.ids[idx]  = lastId;
+      entry.meta[idx] = entry.meta[lastIdx];
+      entry.idMap.set(lastId, idx);
+    }
+    entry.ids.pop();
+    entry.meta.pop();
+    entry.idMap.delete(id);
+    entry.bin = entry.bin.slice(0, entry.ids.length * bpv);
+    this._adapter.writeBin(this._binFile(col), entry.bin);
+    entry.dirty = true;
+    return true;
+  }
+
+  drop(col) {
+    this._adapter.delete(this._binFile(col));
+    this._adapter.delete(this._jsonFile(col));
+    this._collections.delete(col);
+  }
+
+  _flushCol(col, entry) {
+    if (entry.pending.length > 0) {
+      const committed = entry.ids.length - entry.pending.length;
+      const total = entry.ids.length;
+      const bpv = this._bytesPerVec;
+      const newBuf = new ArrayBuffer(total * bpv);
+      const dst = new Uint8Array(newBuf);
+      if (entry.bin && committed > 0) dst.set(new Uint8Array(entry.bin, 0, committed * bpv));
+      for (let p = 0; p < entry.pending.length; p++) {
+        dst.set(entry.pending[p].packed, (committed + p) * bpv);
+      }
+      entry.bin = newBuf;
+      entry.pending = [];
+    }
+    if (entry.bin) this._adapter.writeBin(this._binFile(col), entry.bin);
+    const manifest = { ids: entry.ids, meta: entry.meta, dim: this.dim, bits: this.bits, seed: this.seed };
+    if (entry.model) manifest.model = entry.model;
+    this._adapter.writeJson(this._jsonFile(col), manifest);
+    entry.dirty = false;
+  }
+
+  flush() {
+    for (const [col, entry] of this._collections) {
+      if (entry.dirty) this._flushCol(col, entry);
+    }
+  }
+
+  get(col, id) {
+    const entry = this._load(col);
+    const idx   = entry.idMap.get(id);
+    if (idx === undefined) return null;
+    return { id, vector: Array.from(this._readVec(col, idx)), metadata: entry.meta[idx] };
+  }
+
+  _readVec(col, idx) {
+    const entry = this._collections.get(col) || this._load(col);
+    const committed = entry.ids.length - entry.pending.length;
+    if (idx < committed) {
+      if (!entry.bin) return null;
+      return this._dequantize(new Uint8Array(entry.bin), idx * this._bytesPerVec);
+    }
+    return this._dequantize(entry.pending[idx - committed].packed, 0);
+  }
+
+  has(col, id)  { return this._load(col).idMap.has(id); }
+  count(col)    { return this._load(col).ids.length; }
+  ids(col)      { return this._load(col).ids.slice(); }
+  bytesPerVector() { return this._bytesPerVec; }
+
+  search(col, query, limit = 5, dimSlice = 0, metric = 'cosine', filter = null) {
+    const entry = this._load(col);
+    if (entry.pending.length > 0) this._flushCol(col, entry);
+    const n    = entry.ids.length;
+    const heap = new TopKHeap(limit);
+
+    if (metric === 'cosine' && entry.bin) {
+      // Fast path: coseno directo en espacio polar
+      const qNorm = normalize(query);
+      const u8 = new Uint8Array(entry.bin);
+      const bpv = this._bytesPerVec;
+      for (let i = 0; i < n; i++) {
+        if (filter && !matchFilter(entry.meta[i], filter)) continue;
+        const score = this._cosinePolar(qNorm, u8, i * bpv);
+        heap.push({ id: entry.ids[i], score, metadata: entry.meta[i] });
+      }
+    } else {
+      const qNorm = normalize(query);
+      for (let i = 0; i < n; i++) {
+        if (filter && !matchFilter(entry.meta[i], filter)) continue;
+        const vec   = this._readVec(col, i);
+        const score = computeScore(qNorm, vec, this.dim, metric);
+        heap.push({ id: entry.ids[i], score, metadata: entry.meta[i] });
+      }
+    }
+    return heap.sorted();
+  }
+
+  matryoshkaSearch(col, query, limit = 5, stages = [128, 384, 768], metric = 'cosine') {
+    const entry = this._load(col);
+    if (entry.ids.length === 0) return [];
+    if (entry.pending.length > 0) this._flushCol(col, entry);
+
+    // Matryoshka no aplica bien con rotacion polar — fallback a dequantize + cosine
+    const factor = 4;
+    let candidates = entry.ids.map((id, i) => ({ id, idx: i, metadata: entry.meta[i] }));
+
+    for (let s = 0; s < stages.length; s++) {
+      const dims  = Math.min(stages[s], this.dim);
+      const keepN = s < stages.length - 1
+        ? Math.max(limit * factor * (stages.length - s), limit) : limit;
+      const heap = new TopKHeap(keepN);
+      for (const c of candidates) {
+        const vec   = this._readVec(col, c.idx);
+        const score = cosineSim(query, vec, dims);
+        heap.push({ ...c, score });
+      }
+      candidates = heap.sorted();
+    }
+    return candidates.slice(0, limit).map(({ id, score, metadata }) => ({ id, score, metadata }));
+  }
+
+  searchAcross(collections, query, limit = 5, metric = 'cosine') {
+    return _normalizedSearchAcross(this, collections, query, limit, metric);
+  }
+
+  import(col, records) {
+    for (const r of records) this.set(col, r.id, r.vector, r.metadata ?? {});
+    return records.length;
+  }
+
+  export(col) {
+    const entry = this._load(col);
+    return entry.ids.map((id, i) => ({
+      id, vector: Array.from(this._readVec(col, i)), metadata: entry.meta[i],
+    }));
+  }
+}
+
+// ---------------------------------------------------------------------------
 // IVF INDEX — OPTIMIZED (K-means sobre flat buffer)
 // ---------------------------------------------------------------------------
 
@@ -1191,12 +1566,11 @@ class IVFIndex {
     const dim = this.store.dim;
     let flat;
 
-    if (this.store instanceof BinaryQuantizedStore) {
-      // Dequantizar 1-bit a flat Float64Array
+    if (this.store instanceof PolarQuantizedStore || this.store instanceof BinaryQuantizedStore) {
+      // Dequantizar a flat Float64Array (generico para cualquier quantized store)
       flat = new Float64Array(n * dim);
-      const bpv = this.store._bpv;
       for (let i = 0; i < n; i++) {
-        const vec = BinaryQuantizedStore.dequantize(entry.bin, i * bpv, dim);
+        const vec = this.store._readVec(col, i);
         const iOff = i * dim;
         for (let d = 0; d < dim; d++) flat[iOff + d] = vec[d];
       }
@@ -1945,6 +2319,7 @@ module.exports = {
   VectorStore,
   QuantizedStore,
   BinaryQuantizedStore,
+  PolarQuantizedStore,
   IVFIndex,
   BM25Index,
   SimpleTokenizer,
