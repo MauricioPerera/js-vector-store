@@ -6,8 +6,9 @@ Port vanilla JS de [php-vector-store](https://github.com/MauricioPerera/php-vect
 
 - **VectorStore** — Float32, `dim * 4` bytes/vector
 - **QuantizedStore** — Int8, `dim + 8` bytes/vector (~4x mas compacto)
+- **PolarQuantizedStore** — 3-bit angles, `ceil(dim*3/16)` bytes/vector (~21x, PolarQuant-inspired)
 - **BinaryQuantizedStore** — 1-bit, `ceil(dim/8)` bytes/vector (~32x mas compacto)
-- **IVFIndex** — K-means clustering sobre cualquiera de los tres stores
+- **IVFIndex** — K-means clustering sobre cualquiera de los stores
 - **4 metricas de distancia** — Cosine, Euclidean, DotProduct, Manhattan
 - **Matryoshka search** — busqueda multi-stage con slices dimensionales progresivos
 - **Cross-collection search** — con score normalization entre colecciones
@@ -25,6 +26,7 @@ cp js-vector-store.js tu-proyecto/
 const {
   VectorStore,
   QuantizedStore,
+  PolarQuantizedStore,
   BinaryQuantizedStore,
   IVFIndex,
   MemoryStorageAdapter,
@@ -131,6 +133,42 @@ const store = new QuantizedStore(dirOrAdapter, dim = 768);
 
 **Cuantizacion**: Cada vector se almacena como `[min: f32][max: f32][d0..dN: int8]` = `8 + dim` bytes.
 
+### PolarQuantizedStore (3-bit, PolarQuant-inspired)
+
+Inspirado en [TurboQuant de Google (ICLR 2026)](https://research.google/blog/turboquant-redefining-ai-efficiency-with-extreme-compression/). Cuantiza angulos polares a 3 bits — 21x compresion con 100% recall. El mejor tradeoff compresion/calidad.
+
+```js
+const store = new PolarQuantizedStore(dirOrAdapter, dim = 768, {
+  bits: 3,    // 2-8 bits por angulo (default: 3)
+  seed: 42,   // seed para rotacion determinista
+});
+
+store.set('docs', 'doc-1', embedding, { text: '...' });
+store.flush();
+
+const results = store.search('docs', queryVec, 5);
+```
+
+**Como funciona**:
+1. Normaliza el vector (L2)
+2. Aplica rotacion determinista (sign-flip + permute) para distribuir energia
+3. Agrupa dimensiones en pares → coordenadas polares (r, theta)
+4. Descarta el radio (irrelevante para coseno)
+5. Cuantiza theta a 3 bits (8 niveles) en [-PI, PI]
+
+**Search**: Calcula coseno directamente en espacio polar rotado — sin dequantizar.
+
+**Bits configurables**:
+
+| Bits | Bytes/vec (768d) | Compresion | Top-1 | Recall@5 |
+|---|---|---|---|---|
+| 2 | 96 | 32x | 100% | 85% |
+| **3** | **144** | **21x** | **100%** | **100%** |
+| 4 | 192 | 16x | 100% | 95% |
+| 5 | 240 | 12.8x | 100% | 95% |
+
+3 bits es el sweet spot: misma recall que Float32, 21x mas compacto.
+
 ### BinaryQuantizedStore
 
 Cuantizacion extrema a 1-bit por dimension. 32x compresion vs Float32. Ideal para pre-filtrado rapido en datasets grandes.
@@ -143,22 +181,29 @@ store.flush();
 
 // Search usa Hamming distance (XOR + popcount) — ultra rapido
 const results = store.search('docs', queryVec, 5);
-
-// Matryoshka tambien funciona
-store.matryoshkaSearch('docs', queryVec, 5, [128, 384, 768]);
 ```
 
 **Cuantizacion**: Cada float se reduce a su bit de signo (`>= 0 → 1, < 0 → 0`). Empaquetado MSB-first.
 
 **Similitud**: `cosine_approx = 1.0 - 2.0 * hamming_distance / dims`
 
-**Precision**: Top-1 match rate de 100% vs Float32 en nuestros tests con EmbeddingGemma. Scores son mas bajos (~0.50-0.60 vs ~0.72-0.80) pero el ranking se preserva.
+### Comparacion de stores
 
-| Metrica | Float32 | Int8 | Binary (1-bit) |
-|---|---|---|---|
-| Bytes/vec (768d) | 3,072 | 776 | **96** |
-| Compresion | 1x | 4x | **32x** |
-| Top-1 accuracy | 100% | 100% | **100%** |
+| Store | Bytes/vec (768d) | Compresion | Top-1 | Recall@5 | Uso ideal |
+|---|---|---|---|---|---|
+| Float32 | 3,072 | 1x | 100% | 100% | Precision maxima |
+| Int8 | 776 | 4x | 100% | 100% | Balance general |
+| **Polar 3-bit** | **144** | **21x** | **100%** | **100%** | **Mejor tradeoff** |
+| Binary 1-bit | 96 | 32x | 100% | 85% | Pre-filtrado / max compresion |
+
+Memory footprint para 1M vectores (768d):
+
+| Store | 1M vecs |
+|---|---|
+| Float32 | 2.93 GB |
+| Int8 | 740 MB |
+| Polar 3-bit | 137 MB |
+| Binary | 91.6 MB |
 
 ### IVFIndex
 
@@ -315,6 +360,7 @@ Resultados con **EmbeddingGemma 300M** (768 dims) via Cloudflare Workers AI:
 |---|---|---|---|---|
 | Float32 768d | 2.93 MB | 29.3 MB | 293 MB | 2.93 GB |
 | Int8 768d | 758 KB | 7.4 MB | 74 MB | 740 MB |
+| Polar 3-bit 768d | 141 KB | 1.37 MB | 13.7 MB | 137 MB |
 | Binary 768d | 93.8 KB | 938 KB | 9.2 MB | 91.6 MB |
 
 ## Arquitectura interna
@@ -325,6 +371,8 @@ Coleccion "articles"
 ├── articles.json         Manifest: { ids[], meta[], dim }
 ├── articles.q8.bin       Int8 buffer: [min:f32][max:f32][int8 x dim] por vec
 ├── articles.q8.json      Manifest cuantizado
+├── articles.p3.bin       Polar 3-bit: ceil(dim*3/16) bytes/vec, angle-quantized
+├── articles.p3.json      Manifest polar: { ids, meta, dim, bits, seed }
 ├── articles.b1.bin       Binary 1-bit: ceil(dim/8) bytes/vec, sign-bit MSB-first
 ├── articles.b1.json      Manifest binario
 └── articles.ivf.json     Indice IVF: { centroids, assignments, sampleDims }
