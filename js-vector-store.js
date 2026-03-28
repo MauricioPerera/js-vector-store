@@ -169,6 +169,80 @@ function computeScore(a, b, dims, metric) {
 }
 
 // ---------------------------------------------------------------------------
+// METADATA FILTER
+// ---------------------------------------------------------------------------
+// Soporta: igualdad, comparadores, $in, $nin, $exists, $and, $or, $not, $regex
+//
+// Ejemplos:
+//   { category: 'tech' }                         → igualdad simple
+//   { price: { $gt: 100 } }                      → mayor que
+//   { tags: { $in: ['ai', 'ml'] } }              → contenido en array
+//   { $and: [{ price: { $gte: 10 } }, { price: { $lte: 100 } }] }
+//   { $or: [{ category: 'tech' }, { category: 'science' }] }
+//   { name: { $regex: '^AI' } }                   → regex match
+
+function matchFilter(metadata, filter) {
+  if (!filter || typeof filter !== 'object') return true;
+  if (!metadata) metadata = {};
+
+  for (const key of Object.keys(filter)) {
+    // Logical operators
+    if (key === '$and') {
+      if (!Array.isArray(filter.$and)) return false;
+      for (const sub of filter.$and) {
+        if (!matchFilter(metadata, sub)) return false;
+      }
+      continue;
+    }
+    if (key === '$or') {
+      if (!Array.isArray(filter.$or)) return false;
+      let any = false;
+      for (const sub of filter.$or) {
+        if (matchFilter(metadata, sub)) { any = true; break; }
+      }
+      if (!any) return false;
+      continue;
+    }
+    if (key === '$not') {
+      if (matchFilter(metadata, filter.$not)) return false;
+      continue;
+    }
+
+    const val   = metadata[key];
+    const cond  = filter[key];
+
+    // Simple equality
+    if (cond === null || typeof cond !== 'object') {
+      if (val !== cond) return false;
+      continue;
+    }
+
+    // Operator object
+    for (const op of Object.keys(cond)) {
+      const target = cond[op];
+      switch (op) {
+        case '$eq':     if (val !== target) return false; break;
+        case '$ne':     if (val === target) return false; break;
+        case '$gt':     if (!(val > target)) return false; break;
+        case '$gte':    if (!(val >= target)) return false; break;
+        case '$lt':     if (!(val < target)) return false; break;
+        case '$lte':    if (!(val <= target)) return false; break;
+        case '$in':     if (!Array.isArray(target) || !target.includes(val)) return false; break;
+        case '$nin':    if (Array.isArray(target) && target.includes(val)) return false; break;
+        case '$exists': if ((val !== undefined) !== target) return false; break;
+        case '$regex': {
+          const re = typeof target === 'string' ? new RegExp(target) : target;
+          if (!re.test(String(val ?? ''))) return false;
+          break;
+        }
+        default: break;
+      }
+    }
+  }
+  return true;
+}
+
+// ---------------------------------------------------------------------------
 // SEARCH ACROSS WITH SCORE NORMALIZATION
 // ---------------------------------------------------------------------------
 
@@ -450,12 +524,13 @@ class VectorStore {
     }));
   }
 
-  search(col, query, limit = 5, dimSlice = 0, metric = 'cosine') {
+  search(col, query, limit = 5, dimSlice = 0, metric = 'cosine', filter = null) {
     const entry = this._load(col);
     const dims  = dimSlice > 0 ? dimSlice : this.dim;
     const n     = entry.ids.length;
     const heap  = new TopKHeap(limit);
     for (let i = 0; i < n; i++) {
+      if (filter && !matchFilter(entry.meta[i], filter)) continue;
       const vec   = this._readVec(col, i);
       const score = computeScore(query, vec, dims, metric);
       heap.push({ id: entry.ids[i], score, metadata: entry.meta[i] });
@@ -676,13 +751,14 @@ class QuantizedStore {
   count(col)    { return this._load(col).ids.length; }
   ids(col)      { return this._load(col).ids.slice(); }
 
-  search(col, query, limit = 5, dimSlice = 0, metric = 'cosine') {
+  search(col, query, limit = 5, dimSlice = 0, metric = 'cosine', filter = null) {
     const entry = this._load(col);
     if (entry.pending.length > 0) this._flushCol(col, entry);
     const dims = dimSlice > 0 ? dimSlice : this.dim;
     const n    = entry.ids.length;
     const heap = new TopKHeap(limit);
     for (let i = 0; i < n; i++) {
+      if (filter && !matchFilter(entry.meta[i], filter)) continue;
       const vec   = this._readVec(col, i);
       const score = computeScore(query, vec, dims, metric);
       heap.push({ id: entry.ids[i], score, metadata: entry.meta[i] });
@@ -946,7 +1022,7 @@ class BinaryQuantizedStore {
   /**
    * Search: cosine usa Hamming directo (ultra-rapido), otros dequantizan.
    */
-  search(col, query, limit = 5, dimSlice = 0, metric = 'cosine') {
+  search(col, query, limit = 5, dimSlice = 0, metric = 'cosine', filter = null) {
     const entry = this._load(col);
     if (entry.pending.length > 0) this._flushCol(col, entry);
     const dims = dimSlice > 0 ? Math.min(dimSlice, this.dim) : this.dim;
@@ -958,12 +1034,14 @@ class BinaryQuantizedStore {
       const u8   = new Uint8Array(entry.bin);
       const bpv  = this._bpv;
       for (let i = 0; i < n; i++) {
+        if (filter && !matchFilter(entry.meta[i], filter)) continue;
         const score = BinaryQuantizedStore.binaryCosineSim(qBin, 0, u8, i * bpv, dims);
         heap.push({ id: entry.ids[i], score, metadata: entry.meta[i] });
       }
     } else {
       const qNorm = normalize(query);
       for (let i = 0; i < n; i++) {
+        if (filter && !matchFilter(entry.meta[i], filter)) continue;
         const vec   = this._readVec(col, i);
         const score = computeScore(qNorm, vec, dims, metric);
         heap.push({ id: entry.ids[i], score, metadata: entry.meta[i] });
@@ -1883,4 +1961,5 @@ module.exports = {
   dotProduct,
   manhattanDist,
   computeScore,
+  matchFilter,
 };

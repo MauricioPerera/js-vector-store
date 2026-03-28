@@ -251,7 +251,8 @@ export default {
         const body = await readBody(request);
         if (!body || !body.vector) return err('Required: vector', 400);
         const results = store.search(
-          col, body.vector, body.limit || 5, body.dimSlice || 0, body.metric || 'cosine'
+          col, body.vector, body.limit || 5, body.dimSlice || 0,
+          body.metric || 'cosine', body.filter || null
         );
         return ok({ collection: col, results });
       }
