@@ -11,6 +11,7 @@ const {
   QuantizedStore,
   BinaryQuantizedStore,
   CloudflareKVAdapter,
+  Reranker,
   normalize,
 } = require('../../js-vector-store.js');
 
@@ -155,6 +156,62 @@ export default {
       const results = store.searchAcross(
         body.collections, body.vector, body.limit || 5, body.metric || 'cosine'
       );
+      return ok({ results });
+    }
+
+    // ── Route: POST /v1/rerank ──────────────────────────────
+    // Cross-encoder reranking: toma query_text + candidatos con texto,
+    // reranquea via Workers AI bge-reranker-base
+    if (parts[1] === 'rerank' && method === 'POST') {
+      const body = await readBody(request);
+      if (!body || !body.query || !body.documents) {
+        return err('Required: query (string), documents (string[])', 400);
+      }
+      const cfAccount = env.CF_ACCOUNT_ID;
+      const cfToken   = env.CF_API_TOKEN;
+      if (!cfAccount || !cfToken) {
+        return err('Reranker requires CF_ACCOUNT_ID and CF_API_TOKEN env vars', 500);
+      }
+      const reranker = Reranker.cloudflare(cfAccount, cfToken, body.model);
+      const ranked = await reranker.rank(body.query, body.documents);
+      return ok({ ranked });
+    }
+
+    // ── Route: POST /v1/cross-model-search ───────────────────
+    // Busca en múltiples colecciones (pueden ser de distintos modelos),
+    // reranquea los resultados con cross-encoder
+    if (parts[1] === 'cross-model-search' && method === 'POST') {
+      const body = await readBody(request);
+      if (!body || !body.queryText || !body.sources) {
+        return err('Required: queryText (string), sources ([{collection, queryVector}])', 400);
+      }
+      const cfAccount = env.CF_ACCOUNT_ID;
+      const cfToken   = env.CF_API_TOKEN;
+      if (!cfAccount || !cfToken) {
+        return err('Reranker requires CF_ACCOUNT_ID and CF_API_TOKEN env vars', 500);
+      }
+      const reranker = Reranker.cloudflare(cfAccount, cfToken, body.model);
+      const adapter = new CloudflareKVAdapter(env.VECTOR_KV, prefix);
+      const ext = fileExtensions(storeType);
+      const files = [];
+      for (const s of body.sources) {
+        files.push(s.collection + ext.bin, s.collection + ext.json);
+      }
+      await adapter.preload(files);
+      const store = createStore(adapter, storeType, dim);
+
+      const sources = body.sources.map(s => ({
+        store,
+        collection: s.collection,
+        queryVector: s.queryVector,
+      }));
+
+      const results = await reranker.crossModelSearch(body.queryText, sources, {
+        candidatesPerSource: body.candidatesPerSource || 10,
+        limit: body.limit || 5,
+        textField: body.textField || 'text',
+      });
+
       return ok({ results });
     }
 

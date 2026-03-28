@@ -1281,6 +1281,141 @@ class CloudflareKVAdapter {
 }
 
 // ---------------------------------------------------------------------------
+// RERANKER (cross-encoder para búsqueda cross-model)
+// ---------------------------------------------------------------------------
+// Toma candidatos de múltiples stores/modelos, reranquea con un cross-encoder
+// que evalúa (query_text, doc_text) directamente — independiente del embedding.
+
+class Reranker {
+  /**
+   * @param {object} opts
+   * @param {string} opts.apiUrl   URL del reranker API
+   * @param {string} opts.apiToken Bearer token
+   * @param {string} [opts.model]  Modelo (default: @cf/baai/bge-reranker-base)
+   */
+  constructor({ apiUrl, apiToken, model } = {}) {
+    this.apiUrl   = apiUrl;
+    this.apiToken = apiToken;
+    this.model    = model || '@cf/baai/bge-reranker-base';
+  }
+
+  /**
+   * Crea un Reranker configurado para Cloudflare Workers AI.
+   * @param {string} accountId
+   * @param {string} apiToken
+   * @param {string} [model]
+   */
+  static cloudflare(accountId, apiToken, model) {
+    return new Reranker({
+      apiUrl:   `https://api.cloudflare.com/client/v4/accounts/${accountId}/ai/run/${model || '@cf/baai/bge-reranker-base'}`,
+      apiToken,
+      model:    model || '@cf/baai/bge-reranker-base',
+    });
+  }
+
+  /**
+   * Reranquea documentos contra un query usando el cross-encoder.
+   * @param {string} query         Texto del query
+   * @param {string[]} documents   Textos de los documentos candidatos
+   * @returns {Promise<{index: number, score: number}[]>} Ordenados por score desc
+   */
+  async rank(query, documents) {
+    const res = await fetch(this.apiUrl, {
+      method: 'POST',
+      headers: {
+        'Authorization': `Bearer ${this.apiToken}`,
+        'Content-Type':  'application/json',
+      },
+      body: JSON.stringify({
+        query,
+        contexts: documents.map(d => typeof d === 'string' ? { text: d } : d),
+      }),
+    });
+
+    if (!res.ok) {
+      throw new Error(`Reranker error ${res.status}: ${await res.text()}`);
+    }
+
+    const json = await res.json();
+    // Workers AI retorna: { result: { response: [{ id, score }] } }
+    const data = json.result?.response || json.result?.data || json.result;
+    if (!Array.isArray(data)) {
+      throw new Error('Reranker: unexpected response format');
+    }
+
+    // Normalizar: Workers AI usa 'id' como indice, mapeamos a 'index'
+    const normalized = data.map(r => ({
+      index: r.id ?? r.index,
+      score: r.score,
+    }));
+
+    return normalized.sort((a, b) => b.score - a.score);
+  }
+
+  /**
+   * Búsqueda cross-model: busca en múltiples stores (pueden usar modelos distintos),
+   * recolecta candidatos, y reranquea con el cross-encoder.
+   *
+   * @param {string} queryText                El texto del query (no el vector)
+   * @param {Array<{store, collection, queryVector}>} sources
+   *   Cada source tiene: store (VectorStore/QuantizedStore/BinaryQuantizedStore),
+   *   collection (string), queryVector (el embedding del query para ese modelo)
+   * @param {object} [opts]
+   * @param {number} [opts.candidatesPerSource=10]  Cuántos candidatos por source
+   * @param {number} [opts.limit=5]                 Resultados finales
+   * @param {string} [opts.textField='text']        Campo de metadata con el texto
+   * @returns {Promise<Array<{id, score, metadata, source}>>}
+   */
+  async crossModelSearch(queryText, sources, opts = {}) {
+    const candidatesPerSource = opts.candidatesPerSource || 10;
+    const limit    = opts.limit || 5;
+    const textField = opts.textField || 'text';
+
+    // 1. Buscar candidatos en cada source
+    const allCandidates = [];
+    for (let si = 0; si < sources.length; si++) {
+      const { store, collection, queryVector } = sources[si];
+      const results = store.search(collection, queryVector, candidatesPerSource);
+      for (const r of results) {
+        const text = r.metadata?.[textField];
+        if (text) {
+          allCandidates.push({
+            id:         r.id,
+            text,
+            metadata:   r.metadata,
+            sourceIdx:  si,
+            collection,
+            origScore:  r.score,
+          });
+        }
+      }
+    }
+
+    if (allCandidates.length === 0) return [];
+
+    // 2. Reranquear todos los candidatos con el cross-encoder
+    const documents = allCandidates.map(c => c.text);
+    const ranked = await this.rank(queryText, documents);
+
+    // 3. Mapear resultados
+    const results = [];
+    for (const r of ranked) {
+      if (results.length >= limit) break;
+      const candidate = allCandidates[r.index];
+      results.push({
+        id:         candidate.id,
+        score:      r.score,
+        metadata:   candidate.metadata,
+        collection: candidate.collection,
+        origScore:  candidate.origScore,
+      });
+    }
+
+    return results;
+  }
+}
+
+// ---------------------------------------------------------------------------
 // EXPORTS
 // ---------------------------------------------------------------------------
 
@@ -1289,6 +1424,7 @@ module.exports = {
   QuantizedStore,
   BinaryQuantizedStore,
   IVFIndex,
+  Reranker,
   FileStorageAdapter,
   MemoryStorageAdapter,
   CloudflareKVAdapter,
