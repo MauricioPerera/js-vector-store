@@ -401,6 +401,10 @@ Cada uno es un solo archivo JS, zero dependencias, corre en Node/browser/Workers
 - [Documentacion js-doc-store](https://github.com/MauricioPerera/js-doc-store)
 - [Documentacion server](server/README.md)
 
+## Creditos
+
+Creado por [Mauricio Perera](https://www.linkedin.com/in/mauricioperera/)
+
 ## Licencia
 
 MIT
