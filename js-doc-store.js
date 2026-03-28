@@ -1304,6 +1304,397 @@ class FieldCrypto {
 }
 
 // ---------------------------------------------------------------------------
+// AUTH MODULE (password hashing + JWT + sessions + RBAC)
+// ---------------------------------------------------------------------------
+// Zero deps — usa Web Crypto API (PBKDF2 para passwords, HMAC-SHA256 para JWT)
+//
+// Uso:
+//   const auth = new Auth(db, { secret: 'jwt-secret' });
+//   await auth.init();
+//   const user = await auth.register('alice@test.com', 'password123', { name: 'Alice' });
+//   const { token, user } = await auth.login('alice@test.com', 'password123');
+//   const verified = await auth.verify(token);
+//   await auth.assignRole(user._id, 'admin');
+
+class Auth {
+  /**
+   * @param {DocStore} db
+   * @param {object} opts
+   * @param {string} opts.secret              JWT signing secret
+   * @param {string} [opts.usersCollection]   Default: '_users'
+   * @param {string} [opts.sessionsCollection] Default: '_sessions'
+   * @param {number} [opts.tokenExpiry]       JWT expiry in seconds (default: 86400 = 24h)
+   * @param {number} [opts.hashIterations]    PBKDF2 iterations (default: 100000)
+   * @param {string[]} [opts.defaultRoles]    Roles for new users (default: ['user'])
+   */
+  constructor(db, opts = {}) {
+    this.db              = db;
+    this.secret          = opts.secret;
+    this.usersCol        = opts.usersCollection || '_users';
+    this.sessionsCol     = opts.sessionsCollection || '_sessions';
+    this.tokenExpiry     = opts.tokenExpiry || 86400;
+    this.hashIterations  = opts.hashIterations || 100000;
+    this.defaultRoles    = opts.defaultRoles || ['user'];
+
+    if (!this.secret) throw new Error('Auth: secret is required');
+
+    this._users    = null;
+    this._sessions = null;
+  }
+
+  /** Inicializa colecciones e indices. Llamar una vez al inicio. */
+  async init() {
+    this._users = this.db.collection(this.usersCol);
+    this._sessions = this.db.collection(this.sessionsCol);
+
+    // Indices
+    try { this._users.createIndex('email', { unique: true }); } catch {}
+    try { this._sessions.createIndex('token'); } catch {}
+    try { this._sessions.createIndex('userId'); } catch {}
+  }
+
+  // ── Password hashing (PBKDF2-SHA256) ─────────────────────
+
+  async _hashPassword(password) {
+    const crypto = Auth._getCrypto();
+    const enc = new TextEncoder();
+    const salt = crypto.getRandomValues(new Uint8Array(16));
+
+    const keyMaterial = await crypto.subtle.importKey(
+      'raw', enc.encode(password), 'PBKDF2', false, ['deriveBits']
+    );
+
+    const hash = await crypto.subtle.deriveBits(
+      { name: 'PBKDF2', salt, iterations: this.hashIterations, hash: 'SHA-256' },
+      keyMaterial,
+      256
+    );
+
+    const saltB64 = _uint8ToBase64(salt);
+    const hashB64 = _uint8ToBase64(new Uint8Array(hash));
+    return `pbkdf2:${this.hashIterations}:${saltB64}:${hashB64}`;
+  }
+
+  async _verifyPassword(password, stored) {
+    const parts = stored.split(':');
+    if (parts[0] !== 'pbkdf2') return false;
+
+    const iterations = parseInt(parts[1], 10);
+    const salt = _base64ToUint8(parts[2]);
+    const expectedHash = parts[3];
+
+    const crypto = Auth._getCrypto();
+    const enc = new TextEncoder();
+
+    const keyMaterial = await crypto.subtle.importKey(
+      'raw', enc.encode(password), 'PBKDF2', false, ['deriveBits']
+    );
+
+    const hash = await crypto.subtle.deriveBits(
+      { name: 'PBKDF2', salt, iterations, hash: 'SHA-256' },
+      keyMaterial,
+      256
+    );
+
+    return _uint8ToBase64(new Uint8Array(hash)) === expectedHash;
+  }
+
+  // ── JWT (HMAC-SHA256) ────────────────────────────────────
+
+  async _signJWT(payload) {
+    const crypto = Auth._getCrypto();
+    const enc = new TextEncoder();
+
+    const header  = _b64url({ alg: 'HS256', typ: 'JWT' });
+    const body    = _b64url(payload);
+    const message = `${header}.${body}`;
+
+    const key = await crypto.subtle.importKey(
+      'raw', enc.encode(this.secret),
+      { name: 'HMAC', hash: 'SHA-256' },
+      false, ['sign']
+    );
+
+    const sig = await crypto.subtle.sign('HMAC', key, enc.encode(message));
+    const sigB64 = _uint8ToBase64url(new Uint8Array(sig));
+
+    return `${message}.${sigB64}`;
+  }
+
+  async _verifyJWT(token) {
+    const crypto = Auth._getCrypto();
+    const enc = new TextEncoder();
+
+    const parts = token.split('.');
+    if (parts.length !== 3) return null;
+
+    const message = `${parts[0]}.${parts[1]}`;
+
+    const key = await crypto.subtle.importKey(
+      'raw', enc.encode(this.secret),
+      { name: 'HMAC', hash: 'SHA-256' },
+      false, ['verify']
+    );
+
+    const sig = _base64urlToUint8(parts[2]);
+    const valid = await crypto.subtle.verify('HMAC', key, sig, enc.encode(message));
+
+    if (!valid) return null;
+
+    const payload = JSON.parse(_fromB64url(parts[1]));
+
+    // Check expiry
+    if (payload.exp && Date.now() / 1000 > payload.exp) return null;
+
+    return payload;
+  }
+
+  // ── Public API ───────────────────────────────────────────
+
+  /**
+   * Registra un usuario nuevo.
+   * @param {string} email
+   * @param {string} password
+   * @param {object} [profile]  Campos adicionales (name, etc.)
+   * @returns {Promise<object>}  El usuario creado (sin passwordHash)
+   */
+  async register(email, password, profile = {}) {
+    if (!email || !password) throw new Error('Email and password required');
+    if (password.length < 6) throw new Error('Password must be at least 6 characters');
+
+    const passwordHash = await this._hashPassword(password);
+
+    const user = this._users.insert({
+      email: email.toLowerCase().trim(),
+      passwordHash,
+      roles: this.defaultRoles.slice(),
+      active: true,
+      createdAt: Date.now(),
+      ...profile,
+    });
+
+    // Retornar sin hash
+    const { passwordHash: _, ...safe } = user;
+    return safe;
+  }
+
+  /**
+   * Login: verifica credenciales y retorna JWT.
+   * @returns {Promise<{ token: string, user: object }>}
+   */
+  async login(email, password) {
+    const user = this._users.findOne({ email: email.toLowerCase().trim() });
+    if (!user) throw new Error('Invalid credentials');
+    if (!user.active) throw new Error('Account disabled');
+
+    const valid = await this._verifyPassword(password, user.passwordHash);
+    if (!valid) throw new Error('Invalid credentials');
+
+    // Generar JWT
+    const payload = {
+      sub: user._id,
+      email: user.email,
+      roles: user.roles,
+      iat: Math.floor(Date.now() / 1000),
+      exp: Math.floor(Date.now() / 1000) + this.tokenExpiry,
+    };
+
+    const token = await this._signJWT(payload);
+
+    // Guardar sesion
+    this._sessions.insert({
+      userId: user._id,
+      token,
+      createdAt: Date.now(),
+      expiresAt: Date.now() + this.tokenExpiry * 1000,
+    });
+
+    // Update lastLogin
+    this._users.update({ _id: user._id }, { $set: { lastLogin: Date.now() } });
+
+    const { passwordHash: _, ...safe } = user;
+    return { token, user: safe };
+  }
+
+  /**
+   * Verifica un JWT y retorna el payload.
+   * @returns {Promise<object|null>}  Payload o null si invalido/expirado
+   */
+  async verify(token) {
+    const payload = await this._verifyJWT(token);
+    if (!payload) return null;
+
+    // Verificar que la sesion existe
+    const session = this._sessions.findOne({ token });
+    if (!session) return null;
+
+    return payload;
+  }
+
+  /**
+   * Logout: invalida una sesion.
+   */
+  logout(token) {
+    return this._sessions.remove({ token });
+  }
+
+  /**
+   * Invalida todas las sesiones de un usuario.
+   */
+  logoutAll(userId) {
+    return this._sessions.removeMany({ userId });
+  }
+
+  /**
+   * Cambia el password de un usuario.
+   */
+  async changePassword(userId, oldPassword, newPassword) {
+    const user = this._users.findById(userId);
+    if (!user) throw new Error('User not found');
+
+    const valid = await this._verifyPassword(oldPassword, user.passwordHash);
+    if (!valid) throw new Error('Invalid current password');
+
+    if (newPassword.length < 6) throw new Error('Password must be at least 6 characters');
+
+    const hash = await this._hashPassword(newPassword);
+    this._users.update({ _id: userId }, { $set: { passwordHash: hash } });
+
+    // Invalidar sesiones existentes
+    this._sessions.removeMany({ userId });
+    return true;
+  }
+
+  /**
+   * Reset de password (admin/recovery — sin verificar password viejo).
+   */
+  async resetPassword(userId, newPassword) {
+    if (newPassword.length < 6) throw new Error('Password must be at least 6 characters');
+    const hash = await this._hashPassword(newPassword);
+    this._users.update({ _id: userId }, { $set: { passwordHash: hash } });
+    this._sessions.removeMany({ userId });
+    return true;
+  }
+
+  // ── Roles / RBAC ────────────────────────────────────────
+
+  assignRole(userId, role) {
+    const user = this._users.findById(userId);
+    if (!user) throw new Error('User not found');
+    if (user.roles.includes(role)) return;
+    this._users.update({ _id: userId }, { $push: { roles: role } });
+  }
+
+  removeRole(userId, role) {
+    const user = this._users.findById(userId);
+    if (!user) throw new Error('User not found');
+    this._users.update({ _id: userId }, { $pull: { roles: role } });
+  }
+
+  hasRole(userId, role) {
+    const user = this._users.findById(userId);
+    return user ? user.roles.includes(role) : false;
+  }
+
+  /**
+   * Middleware-style: verifica token Y rol.
+   * @returns {Promise<object|null>}  Payload si autorizado, null si no
+   */
+  async authorize(token, requiredRole) {
+    const payload = await this.verify(token);
+    if (!payload) return null;
+    if (requiredRole && !payload.roles.includes(requiredRole)) return null;
+    return payload;
+  }
+
+  // ── User management ──────────────────────────────────────
+
+  getUser(userId) {
+    const user = this._users.findById(userId);
+    if (!user) return null;
+    const { passwordHash: _, ...safe } = user;
+    return safe;
+  }
+
+  getUserByEmail(email) {
+    const user = this._users.findOne({ email: email.toLowerCase().trim() });
+    if (!user) return null;
+    const { passwordHash: _, ...safe } = user;
+    return safe;
+  }
+
+  listUsers(filter = {}, opts = {}) {
+    let cursor = this._users.find(filter);
+    if (opts.sort) cursor = cursor.sort(opts.sort);
+    if (opts.skip) cursor = cursor.skip(opts.skip);
+    if (opts.limit) cursor = cursor.limit(opts.limit);
+    return cursor.toArray().map(u => {
+      const { passwordHash: _, ...safe } = u;
+      return safe;
+    });
+  }
+
+  disableUser(userId) {
+    this._users.update({ _id: userId }, { $set: { active: false } });
+    this._sessions.removeMany({ userId });
+  }
+
+  enableUser(userId) {
+    this._users.update({ _id: userId }, { $set: { active: true } });
+  }
+
+  deleteUser(userId) {
+    this._users.removeById(userId);
+    this._sessions.removeMany({ userId });
+  }
+
+  /**
+   * Limpia sesiones expiradas.
+   */
+  cleanExpiredSessions() {
+    return this._sessions.removeMany({
+      expiresAt: { $lt: Date.now() },
+    });
+  }
+
+  static _getCrypto() {
+    if (typeof globalThis.crypto !== 'undefined' && globalThis.crypto.subtle) {
+      return globalThis.crypto;
+    }
+    try {
+      const { webcrypto } = require('crypto');
+      return webcrypto;
+    } catch {
+      throw new Error('Auth: Web Crypto API not available');
+    }
+  }
+}
+
+// JWT base64url helpers
+function _b64url(obj) {
+  const json = JSON.stringify(obj);
+  const b64 = _uint8ToBase64(new TextEncoder().encode(json));
+  return b64.replace(/\+/g, '-').replace(/\//g, '_').replace(/=+$/, '');
+}
+
+function _fromB64url(str) {
+  const b64 = str.replace(/-/g, '+').replace(/_/g, '/');
+  const padded = b64 + '='.repeat((4 - b64.length % 4) % 4);
+  const bytes = _base64ToUint8(padded);
+  return new TextDecoder().decode(bytes);
+}
+
+function _uint8ToBase64url(uint8) {
+  return _uint8ToBase64(uint8).replace(/\+/g, '-').replace(/\//g, '_').replace(/=+$/, '');
+}
+
+function _base64urlToUint8(str) {
+  const b64 = str.replace(/-/g, '+').replace(/_/g, '/');
+  const padded = b64 + '='.repeat((4 - b64.length % 4) % 4);
+  return _base64ToUint8(padded);
+}
+
+// ---------------------------------------------------------------------------
 // EXPORTS
 // ---------------------------------------------------------------------------
 
@@ -1319,6 +1710,7 @@ module.exports = {
   CloudflareKVAdapter,
   EncryptedAdapter,
   FieldCrypto,
+  Auth,
   // Utils
   matchFilter,
   applyUpdate,
