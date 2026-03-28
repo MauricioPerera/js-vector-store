@@ -337,6 +337,22 @@ Coleccion "articles"
 - Min-heap para top-K — O(n log k) en vez de O(n log n)
 - K-means sobre flat Float64Array contiguos — sin allocations por iteracion
 
+## Ecosistema
+
+Este repo contiene tres modulos independientes que comparten storage adapters:
+
+| Modulo | Archivo | Que hace |
+|---|---|---|
+| **js-vector-store** | `js-vector-store.js` | Busqueda semantica: embeddings, similarity, IVF, Matryoshka, reranking |
+| **js-doc-store** | `js-doc-store.js` | Document database: CRUD, queries, indices, joins, aggregation, auth, encriptacion |
+| **js-vector-server** | `server/` | REST API sobre Cloudflare Workers + KV |
+
+Cada uno es un solo archivo JS, zero dependencias, corre en Node/browser/Workers/Deno.
+
+- [Documentacion js-vector-store](README.md) (este archivo)
+- [Documentacion js-doc-store](DOC-STORE.md)
+- [Documentacion server](server/README.md)
+
 ## Licencia
 
 MIT

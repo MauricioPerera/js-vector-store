@@ -405,6 +405,79 @@ Coleccion "users"
 | `SELECT u.name, SUM(o.price) FROM orders o JOIN users u ON o.userId = u._id GROUP BY u.name` | `orders.aggregate().lookup({ from: 'users', localField: 'userId', foreignField: '_id', as: 'user', single: true }).group('user.name', { total: { $sum: 'price' } }).toArray()` |
 | `CREATE UNIQUE INDEX idx ON users(email)` | `users.createIndex('email', { unique: true })` |
 
+## Benchmark
+
+Resultados en Node.js, N=10,000 documentos:
+
+### Queries
+
+| Operacion | Latencia | Notas |
+|---|---|---|
+| findOne (hash index) | **29us** | O(1) lookup |
+| hash lookup + limit 10 | 1.06ms | Indice + clone solo top 10 |
+| range index + limit 10 | 2.42ms | Binary search + limit |
+| full scan + limit 10 | 1.45ms | Sin indice, early limit |
+| sort indexed + limit 10 | 4.81ms | SortedIndex, sin sort en memoria |
+| sort in-memory + limit 10 | 5.15ms | Fallback sin indice |
+| count (con filtro) | 1.36ms | Sin allocations |
+
+### Writes
+
+| Operacion | Latencia |
+|---|---|
+| insert | 47us/doc |
+| update ($inc) | 278us/op |
+| flush (10K docs) | 424us |
+
+### Escalabilidad
+
+| N docs | insert total | findOne | scan + limit 10 |
+|---|---|---|---|
+| 100 | 7ms | 22us | 757us |
+| 1,000 | 52ms | 16us | 6.85ms |
+| 5,000 | 155ms | 18us | 29.9ms |
+| 10,000 | 470ms | 27us | 61.2ms |
+| 50,000 | 4.24s | 101us | 326ms |
+
+### Optimizaciones internas
+
+- **structuredClone** cuando disponible, JSON fallback
+- **Clone solo en frontera** — operaciones internas trabajan con refs raw
+- **Skip+limit antes de clone** — solo clona los N resultados finales
+- **SortedIndex en cursor.sort()** — evita sort en memoria cuando hay indice
+- **_countMatching** — cuenta sin allocar array de resultados
+- **Dirty tracking** — `_dirtyIds` para flush incremental
+
+## Comparacion vs D1
+
+| Aspecto | js-doc-store | D1 |
+|---|---|---|
+| Costo por query | **$0** (CPU del Worker) | $0.001/M rows read |
+| Costo por write | **$0** (flush a KV) | $1.00/M rows written |
+| Storage | KV: $0.50/GB | $0.75/GB |
+| Max docs | ~100K (limite memoria) | Millones |
+| SQL | No (queries MongoDB-style) | Si (SQLite completo) |
+| Joins | lookup() en aggregation | JOIN nativo |
+| ACID | No (eventual consistency) | Si |
+| Portabilidad | Node/browser/Workers/Deno | Solo Cloudflare |
+| Offline | Si | No |
+| Encriptacion | AES-256-GCM built-in | No |
+| Auth | JWT + RBAC built-in | No |
+
+**Recomendacion**: js-doc-store para < 100K docs con portabilidad, encriptacion, o auth integrado. D1 para datasets grandes con SQL complejo.
+
+## Ecosistema
+
+js-doc-store es parte del ecosistema js-vector:
+
+```
+js-vector-store.js   → busqueda semantica (embeddings, similarity, RAG)
+js-doc-store.js      → busqueda estructurada (CRUD, queries, joins, auth)
+server/              → REST API sobre Cloudflare Workers + KV
+```
+
+Los tres comparten los mismos storage adapters y funcionan en los mismos entornos.
+
 ## Licencia
 
 MIT
