@@ -1,0 +1,13 @@
+{
+  "name": "js-vector-server",
+  "version": "1.0.0",
+  "private": true,
+  "description": "Vector database as a service on Cloudflare Workers",
+  "scripts": {
+    "dev": "wrangler dev",
+    "deploy": "wrangler deploy"
+  },
+  "devDependencies": {
+    "wrangler": "^4"
+  }
+}

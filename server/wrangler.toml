@@ -1,0 +1,12 @@
+name = "js-vector-server"
+main = "src/index.js"
+compatibility_date = "2025-04-01"
+
+[[kv_namespaces]]
+binding = "VECTOR_KV"
+id = "9ebf9e82e33d47b48bb179398bafae15"
+
+[vars]
+API_TOKEN = ""
+STORE_TYPE = "binary"
+DIMENSIONS = "768"
