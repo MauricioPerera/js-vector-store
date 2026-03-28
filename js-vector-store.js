@@ -279,9 +279,17 @@ class MemoryStorageAdapter {
 // ---------------------------------------------------------------------------
 
 class VectorStore {
-  constructor(dirOrAdapter, dim = 768, maxCollections = 50) {
+  /**
+   * @param {string|object} dirOrAdapter
+   * @param {number} dim
+   * @param {number} maxCollections
+   * @param {object} [opts]
+   * @param {string} [opts.model]  Modelo de embeddings (se guarda en el manifest)
+   */
+  constructor(dirOrAdapter, dim = 768, maxCollections = 50, opts = {}) {
     this.dim           = dim;
     this.maxCollections = maxCollections;
+    this.defaultModel  = opts.model || null;
     this._adapter      = typeof dirOrAdapter === 'string'
       ? new FileStorageAdapter(dirOrAdapter)
       : dirOrAdapter;
@@ -297,13 +305,20 @@ class VectorStore {
     const manifest = this._adapter.readJson(this._jsonFile(col));
     const ids  = manifest ? manifest.ids  : [];
     const meta = manifest ? manifest.meta : [];
+    const model = manifest?.model || this.defaultModel || null;
     const idMap = new Map();
     for (let i = 0; i < ids.length; i++) idMap.set(ids[i], i);
     const bin = this._adapter.readBin(this._binFile(col));
-    const entry = { ids, meta, idMap, bin, pending: [], dirty: false };
+    const entry = { ids, meta, idMap, bin, model, pending: [], dirty: false };
     this._collections.set(col, entry);
     return entry;
   }
+
+  /** Retorna el modelo de embeddings de una coleccion, o null. */
+  getModel(col) { return this._load(col).model; }
+
+  /** Setea el modelo de embeddings para una coleccion. */
+  setModel(col, model) { const e = this._load(col); e.model = model; e.dirty = true; }
 
   _readVec(col, idx) {
     const entry = this._collections.get(col) || this._load(col);
@@ -391,7 +406,9 @@ class VectorStore {
       entry.pending = [];
     }
     if (entry.bin) this._adapter.writeBin(this._binFile(col), entry.bin);
-    this._adapter.writeJson(this._jsonFile(col), { ids: entry.ids, meta: entry.meta, dim: this.dim });
+    const manifest = { ids: entry.ids, meta: entry.meta, dim: this.dim };
+    if (entry.model) manifest.model = entry.model;
+    this._adapter.writeJson(this._jsonFile(col), manifest);
     entry.dirty = false;
   }
 
@@ -483,8 +500,9 @@ class VectorStore {
 // ---------------------------------------------------------------------------
 
 class QuantizedStore {
-  constructor(dirOrAdapter, dim = 768) {
-    this.dim      = dim;
+  constructor(dirOrAdapter, dim = 768, opts = {}) {
+    this.dim          = dim;
+    this.defaultModel = opts.model || null;
     this._adapter = typeof dirOrAdapter === 'string'
       ? new FileStorageAdapter(dirOrAdapter)
       : dirOrAdapter;
@@ -500,13 +518,17 @@ class QuantizedStore {
     const manifest = this._adapter.readJson(this._jsonFile(col));
     const ids  = manifest ? manifest.ids  : [];
     const meta = manifest ? manifest.meta : [];
+    const model = manifest?.model || this.defaultModel || null;
     const idMap = new Map();
     for (let i = 0; i < ids.length; i++) idMap.set(ids[i], i);
     const bin = this._adapter.readBin(this._binFile(col));
-    const entry = { ids, meta, idMap, bin, pending: [], dirty: false };
+    const entry = { ids, meta, idMap, bin, model, pending: [], dirty: false };
     this._collections.set(col, entry);
     return entry;
   }
+
+  getModel(col) { return this._load(col).model; }
+  setModel(col, model) { const e = this._load(col); e.model = model; e.dirty = true; }
 
   _quantize(vector) {
     let min = Infinity, max = -Infinity;
@@ -631,7 +653,9 @@ class QuantizedStore {
       entry.pending = [];
     }
     if (entry.bin) this._adapter.writeBin(this._binFile(col), entry.bin);
-    this._adapter.writeJson(this._jsonFile(col), { ids: entry.ids, meta: entry.meta, dim: this.dim });
+    const manifest = { ids: entry.ids, meta: entry.meta, dim: this.dim };
+    if (entry.model) manifest.model = entry.model;
+    this._adapter.writeJson(this._jsonFile(col), manifest);
     entry.dirty = false;
   }
 
@@ -712,8 +736,9 @@ class QuantizedStore {
 // Similitud via Hamming: cosine_approx = 1.0 - 2.0 * hamming / dims
 
 class BinaryQuantizedStore {
-  constructor(dirOrAdapter, dim = 768) {
-    this.dim      = dim;
+  constructor(dirOrAdapter, dim = 768, opts = {}) {
+    this.dim          = dim;
+    this.defaultModel = opts.model || null;
     this._bpv     = Math.ceil(dim / 8); // bytes per vector
     this._adapter = typeof dirOrAdapter === 'string'
       ? new FileStorageAdapter(dirOrAdapter)
@@ -729,13 +754,17 @@ class BinaryQuantizedStore {
     const manifest = this._adapter.readJson(this._jsonFile(col));
     const ids  = manifest ? manifest.ids  : [];
     const meta = manifest ? manifest.meta : [];
+    const model = manifest?.model || this.defaultModel || null;
     const idMap = new Map();
     for (let i = 0; i < ids.length; i++) idMap.set(ids[i], i);
     const bin = this._adapter.readBin(this._binFile(col));
-    const entry = { ids, meta, idMap, bin, pending: [], dirty: false };
+    const entry = { ids, meta, idMap, bin, model, pending: [], dirty: false };
     this._collections.set(col, entry);
     return entry;
   }
+
+  getModel(col) { return this._load(col).model; }
+  setModel(col, model) { const e = this._load(col); e.model = model; e.dirty = true; }
 
   /**
    * Cuantiza float[] a binario (1-bit por dimensión).
@@ -889,7 +918,9 @@ class BinaryQuantizedStore {
       entry.pending = [];
     }
     if (entry.bin) this._adapter.writeBin(this._binFile(col), entry.bin);
-    this._adapter.writeJson(this._jsonFile(col), { ids: entry.ids, meta: entry.meta, dim: this.dim });
+    const manifest = { ids: entry.ids, meta: entry.meta, dim: this.dim };
+    if (entry.model) manifest.model = entry.model;
+    this._adapter.writeJson(this._jsonFile(col), manifest);
     entry.dirty = false;
   }
 
@@ -1412,6 +1443,57 @@ class Reranker {
     }
 
     return results;
+  }
+
+  /**
+   * Búsqueda automática cross-model: lee el modelo de cada colección del manifest,
+   * genera embeddings automáticamente, busca, y reranquea.
+   *
+   * @param {string} queryText          Texto del query
+   * @param {object} store              Store (VectorStore/QuantizedStore/BinaryQuantizedStore)
+   * @param {string[]} collections      Nombres de colecciones a buscar
+   * @param {function} embedFn          async (text, model) => float[] — genera embedding
+   * @param {object} [opts]
+   * @param {number} [opts.candidatesPerSource=10]
+   * @param {number} [opts.limit=5]
+   * @param {string} [opts.textField='text']
+   * @returns {Promise<Array<{id, score, metadata, collection}>>}
+   */
+  async autoSearch(queryText, store, collections, embedFn, opts = {}) {
+    const candidatesPerSource = opts.candidatesPerSource || 10;
+    const limit     = opts.limit || 5;
+    const textField = opts.textField || 'text';
+
+    // 1. Agrupar colecciones por modelo
+    const byModel = new Map(); // model → [collection, ...]
+    for (const col of collections) {
+      const model = store.getModel(col);
+      if (!model) throw new Error(`Collection "${col}" has no model set. Use store.setModel('${col}', 'model-name') or pass model in constructor.`);
+      if (!byModel.has(model)) byModel.set(model, []);
+      byModel.get(model).push(col);
+    }
+
+    // 2. Generar un embedding por modelo (una sola llamada por modelo)
+    const embeddings = new Map(); // model → vector
+    const embedPromises = [];
+    for (const model of byModel.keys()) {
+      embedPromises.push(
+        embedFn(queryText, model).then(vec => embeddings.set(model, vec))
+      );
+    }
+    await Promise.all(embedPromises);
+
+    // 3. Buscar en cada coleccion con el embedding de su modelo
+    const sources = collections.map(col => ({
+      store,
+      collection: col,
+      queryVector: embeddings.get(store.getModel(col)),
+    }));
+
+    // 4. Recolectar candidatos y reranquear
+    return this.crossModelSearch(queryText, sources, {
+      candidatesPerSource, limit, textField,
+    });
   }
 }
 
