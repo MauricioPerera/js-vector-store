@@ -392,13 +392,13 @@ Este repo contiene tres modulos independientes que comparten storage adapters:
 | Modulo | Archivo | Que hace |
 |---|---|---|
 | **js-vector-store** | `js-vector-store.js` | Busqueda semantica: embeddings, similarity, IVF, Matryoshka, reranking |
-| **js-doc-store** | `js-doc-store.js` | Document database: CRUD, queries, indices, joins, aggregation, auth, encriptacion |
+| **[js-doc-store](https://github.com/MauricioPerera/js-doc-store)** | Repo separado | Document database: CRUD, queries, indices, joins, aggregation, auth, encriptacion |
 | **js-vector-server** | `server/` | REST API sobre Cloudflare Workers + KV |
 
 Cada uno es un solo archivo JS, zero dependencias, corre en Node/browser/Workers/Deno.
 
 - [Documentacion js-vector-store](README.md) (este archivo)
-- [Documentacion js-doc-store](DOC-STORE.md)
+- [Documentacion js-doc-store](https://github.com/MauricioPerera/js-doc-store)
 - [Documentacion server](server/README.md)
 
 ## Licencia
