@@ -1057,6 +1057,253 @@ class DocStore {
 }
 
 // ---------------------------------------------------------------------------
+// ENCRYPTED ADAPTER (AES-256-GCM, zero deps — usa Web Crypto API)
+// ---------------------------------------------------------------------------
+// Wrapper sobre cualquier adapter. Encripta JSON antes de escribir,
+// desencripta al leer. Compatible con Node 16+, browser, Workers, Deno.
+//
+// Uso:
+//   const adapter = await EncryptedAdapter.create(innerAdapter, 'mi-password');
+//   const db = new DocStore(adapter);
+
+class EncryptedAdapter {
+  /**
+   * @param {object} inner   Adapter interno (FileStorage, Memory, KV, etc.)
+   * @param {CryptoKey} key  AES-256-GCM key derivada del password
+   */
+  constructor(inner, key) {
+    this.inner = inner;
+    this._key  = key;
+  }
+
+  /**
+   * Crea un EncryptedAdapter derivando una key AES-256 del password.
+   * @param {object} inner    Adapter interno
+   * @param {string} password Password para derivar la key
+   * @param {string} [salt]   Salt (default: 'js-doc-store-v1')
+   * @returns {Promise<EncryptedAdapter>}
+   */
+  static async create(inner, password, salt = 'js-doc-store-v1') {
+    const crypto = EncryptedAdapter._getCrypto();
+    const enc = new TextEncoder();
+
+    // Derivar key con PBKDF2
+    const keyMaterial = await crypto.subtle.importKey(
+      'raw', enc.encode(password), 'PBKDF2', false, ['deriveKey']
+    );
+
+    const key = await crypto.subtle.deriveKey(
+      { name: 'PBKDF2', salt: enc.encode(salt), iterations: 100000, hash: 'SHA-256' },
+      keyMaterial,
+      { name: 'AES-GCM', length: 256 },
+      false,
+      ['encrypt', 'decrypt']
+    );
+
+    return new EncryptedAdapter(inner, key);
+  }
+
+  static _getCrypto() {
+    if (typeof globalThis.crypto !== 'undefined' && globalThis.crypto.subtle) {
+      return globalThis.crypto;
+    }
+    // Node.js < 19
+    try {
+      const { webcrypto } = require('crypto');
+      return webcrypto;
+    } catch {
+      throw new Error('EncryptedAdapter: Web Crypto API not available');
+    }
+  }
+
+  async _encrypt(data) {
+    const crypto = EncryptedAdapter._getCrypto();
+    const enc = new TextEncoder();
+    const plaintext = enc.encode(JSON.stringify(data));
+
+    // Random IV (12 bytes para AES-GCM)
+    const iv = crypto.getRandomValues(new Uint8Array(12));
+
+    const ciphertext = await crypto.subtle.encrypt(
+      { name: 'AES-GCM', iv },
+      this._key,
+      plaintext
+    );
+
+    // Formato: [iv (12 bytes)][ciphertext]
+    const result = new Uint8Array(12 + ciphertext.byteLength);
+    result.set(iv);
+    result.set(new Uint8Array(ciphertext), 12);
+
+    // Encodear a base64 para almacenar como string en JSON adapters
+    return _uint8ToBase64(result);
+  }
+
+  async _decrypt(encoded) {
+    const crypto = EncryptedAdapter._getCrypto();
+    const combined = _base64ToUint8(encoded);
+
+    const iv         = combined.slice(0, 12);
+    const ciphertext = combined.slice(12);
+
+    const plaintext = await crypto.subtle.decrypt(
+      { name: 'AES-GCM', iv },
+      this._key,
+      ciphertext
+    );
+
+    const dec = new TextDecoder();
+    return JSON.parse(dec.decode(plaintext));
+  }
+
+  // ── Sync interface (con cache para operaciones sync) ─────
+
+  /**
+   * Precarga y desencripta archivos a un cache interno.
+   * Llamar antes de operaciones sync.
+   * @param {string[]} filenames
+   */
+  async preload(filenames) {
+    if (!this._cache) this._cache = new Map();
+    for (const f of filenames) {
+      const encrypted = this.inner.readJson(f);
+      if (encrypted && encrypted.__enc) {
+        try {
+          const decrypted = await this._decrypt(encrypted.__enc);
+          this._cache.set(f, decrypted);
+        } catch {
+          // Key incorrecta o datos corruptos
+          this._cache.set(f, null);
+        }
+      }
+    }
+  }
+
+  readJson(filename) {
+    // Si hay cache (preloaded), usar
+    if (this._cache && this._cache.has(filename)) {
+      return this._cache.get(filename);
+    }
+    // Sync read: intenta leer y desencriptar (solo funciona si ya esta en cache)
+    const encrypted = this.inner.readJson(filename);
+    if (!encrypted) return null;
+    if (!encrypted.__enc) return encrypted; // no encriptado, leer directo
+    // No podemos desencriptar sync — retornar null
+    return null;
+  }
+
+  writeJson(filename, data) {
+    // Marcar para encriptar en persist()
+    if (!this._pending) this._pending = new Map();
+    this._pending.set(filename, data);
+    // Tambien actualizar cache
+    if (!this._cache) this._cache = new Map();
+    this._cache.set(filename, data);
+  }
+
+  delete(filename) {
+    if (this._cache) this._cache.delete(filename);
+    if (this._pending) this._pending.delete(filename);
+    this.inner.delete(filename);
+  }
+
+  /**
+   * Encripta y persiste todos los datos pendientes.
+   * Llamar despues de db.flush().
+   */
+  async persist() {
+    if (!this._pending) return;
+    for (const [filename, data] of this._pending) {
+      const encrypted = await this._encrypt(data);
+      this.inner.writeJson(filename, { __enc: encrypted });
+    }
+    this._pending.clear();
+  }
+}
+
+// Base64 helpers (compatible con browser + Node sin Buffer)
+function _uint8ToBase64(uint8) {
+  if (typeof Buffer !== 'undefined') return Buffer.from(uint8).toString('base64');
+  let binary = '';
+  for (let i = 0; i < uint8.length; i++) binary += String.fromCharCode(uint8[i]);
+  return btoa(binary);
+}
+
+function _base64ToUint8(base64) {
+  if (typeof Buffer !== 'undefined') {
+    const buf = Buffer.from(base64, 'base64');
+    return new Uint8Array(buf.buffer, buf.byteOffset, buf.byteLength);
+  }
+  const binary = atob(base64);
+  const uint8 = new Uint8Array(binary.length);
+  for (let i = 0; i < binary.length; i++) uint8[i] = binary.charCodeAt(i);
+  return uint8;
+}
+
+// ---------------------------------------------------------------------------
+// FIELD-LEVEL ENCRYPTION HELPERS
+// ---------------------------------------------------------------------------
+// Para encriptar campos individuales dentro de un documento sin encriptar
+// toda la base de datos.
+//
+// Uso:
+//   const fieldCrypto = await FieldCrypto.create('my-password');
+//   users.insert({
+//     name: 'Alice',
+//     ssn: await fieldCrypto.encrypt('123-45-6789'),
+//     email: await fieldCrypto.encrypt('alice@secret.com'),
+//   });
+//   const doc = users.findById(id);
+//   const ssn = await fieldCrypto.decrypt(doc.ssn); // '123-45-6789'
+
+class FieldCrypto {
+  constructor(key) { this._key = key; }
+
+  static async create(password, salt = 'js-doc-field-v1') {
+    const crypto = EncryptedAdapter._getCrypto();
+    const enc = new TextEncoder();
+    const keyMaterial = await crypto.subtle.importKey(
+      'raw', enc.encode(password), 'PBKDF2', false, ['deriveKey']
+    );
+    const key = await crypto.subtle.deriveKey(
+      { name: 'PBKDF2', salt: enc.encode(salt), iterations: 100000, hash: 'SHA-256' },
+      keyMaterial,
+      { name: 'AES-GCM', length: 256 },
+      false,
+      ['encrypt', 'decrypt']
+    );
+    return new FieldCrypto(key);
+  }
+
+  async encrypt(value) {
+    const crypto = EncryptedAdapter._getCrypto();
+    const enc = new TextEncoder();
+    const plaintext = enc.encode(typeof value === 'string' ? value : JSON.stringify(value));
+    const iv = crypto.getRandomValues(new Uint8Array(12));
+    const ciphertext = await crypto.subtle.encrypt({ name: 'AES-GCM', iv }, this._key, plaintext);
+    const result = new Uint8Array(12 + ciphertext.byteLength);
+    result.set(iv);
+    result.set(new Uint8Array(ciphertext), 12);
+    return '$enc$' + _uint8ToBase64(result);
+  }
+
+  async decrypt(encoded) {
+    if (typeof encoded !== 'string' || !encoded.startsWith('$enc$')) return encoded;
+    const crypto = EncryptedAdapter._getCrypto();
+    const combined = _base64ToUint8(encoded.slice(5));
+    const iv = combined.slice(0, 12);
+    const ciphertext = combined.slice(12);
+    const plaintext = await crypto.subtle.decrypt({ name: 'AES-GCM', iv }, this._key, ciphertext);
+    const text = new TextDecoder().decode(plaintext);
+    try { return JSON.parse(text); } catch { return text; }
+  }
+
+  isEncrypted(value) {
+    return typeof value === 'string' && value.startsWith('$enc$');
+  }
+}
+
+// ---------------------------------------------------------------------------
 // EXPORTS
 // ---------------------------------------------------------------------------
 
@@ -1070,6 +1317,8 @@ module.exports = {
   FileStorageAdapter,
   MemoryStorageAdapter,
   CloudflareKVAdapter,
+  EncryptedAdapter,
+  FieldCrypto,
   // Utils
   matchFilter,
   applyUpdate,
