@@ -1312,6 +1312,368 @@ class CloudflareKVAdapter {
 }
 
 // ---------------------------------------------------------------------------
+// BM25 INDEX (Okapi BM25 full-text search)
+// ---------------------------------------------------------------------------
+// Port de php-vector-store BM25\Index + SimpleTokenizer
+// Inverted index con IDF + term frequency normalization
+
+/**
+ * Tokenizer simple: lowercase, split en non-alphanumeric, filtrar stop words.
+ */
+class SimpleTokenizer {
+  constructor(stopWords = null, minLength = 2) {
+    this.minLength = minLength;
+    const words = stopWords || SimpleTokenizer.DEFAULT_STOP_WORDS;
+    this.stopWords = new Set(words);
+  }
+
+  tokenize(text) {
+    return text
+      .toLowerCase()
+      .split(/[^\p{L}\p{N}]+/u)
+      .filter(t => t.length >= this.minLength && !this.stopWords.has(t));
+  }
+}
+
+SimpleTokenizer.DEFAULT_STOP_WORDS = [
+  'a','about','above','after','again','against','all','am','an','and','any','are',
+  'aren\'t','as','at','be','because','been','before','being','below','between','both',
+  'but','by','can\'t','cannot','could','couldn\'t','did','didn\'t','do','does','doesn\'t',
+  'doing','don\'t','down','during','each','few','for','from','further','get','got','had',
+  'hadn\'t','has','hasn\'t','have','haven\'t','having','he','her','here','hers','herself',
+  'him','himself','his','how','i','if','in','into','is','isn\'t','it','its','itself',
+  'let\'s','me','more','most','mustn\'t','my','myself','no','nor','not','of','off','on',
+  'once','only','or','other','ought','our','ours','ourselves','out','over','own','same',
+  'shan\'t','she','should','shouldn\'t','so','some','such','than','that','the','their',
+  'theirs','them','themselves','then','there','these','they','this','those','through','to',
+  'too','under','until','up','very','was','wasn\'t','we','were','weren\'t','what','when',
+  'where','which','while','who','whom','why','will','with','won\'t','would','wouldn\'t',
+  'you','your','yours','yourself','yourselves',
+  // Spanish
+  'el','la','los','las','un','una','unos','unas','de','del','al','en','con','por','para',
+  'es','son','fue','ser','como','pero','su','sus','se','le','les','lo','que','y','o','no',
+  'si','mi','tu','nos','mas','este','esta','estos','estas','ese','esa','esos','esas',
+];
+
+/**
+ * BM25 Index: inverted index con Okapi BM25 scoring.
+ */
+class BM25Index {
+  /**
+   * @param {object} [opts]
+   * @param {number} [opts.k1=1.5]  Term frequency saturation
+   * @param {number} [opts.b=0.75]  Length normalization (0-1)
+   * @param {SimpleTokenizer|object} [opts.tokenizer]  Debe tener .tokenize(text)
+   */
+  constructor(opts = {}) {
+    this.k1 = opts.k1 ?? 1.5;
+    this.b  = opts.b  ?? 0.75;
+    this.tokenizer = opts.tokenizer || new SimpleTokenizer();
+
+    // Per-collection data:
+    // invertedIndex[col][term][docId] = tf
+    // docLengths[col][docId] = tokenCount
+    // totalTokens[col] = int
+    // docCount[col] = int
+    this._data = new Map();
+  }
+
+  _getCol(col) {
+    if (!this._data.has(col)) {
+      this._data.set(col, {
+        invertedIndex: new Map(),
+        docLengths: new Map(),
+        totalTokens: 0,
+        docCount: 0,
+      });
+    }
+    return this._data.get(col);
+  }
+
+  /**
+   * Agrega un documento al indice BM25.
+   */
+  addDocument(col, id, text) {
+    const d = this._getCol(col);
+    // Si ya existe, remover primero
+    if (d.docLengths.has(id)) this.removeDocument(col, id);
+
+    const tokens = this.tokenizer.tokenize(text);
+    d.docLengths.set(id, tokens.length);
+    d.totalTokens += tokens.length;
+    d.docCount++;
+
+    // Contar term frequencies
+    const tf = new Map();
+    for (const t of tokens) tf.set(t, (tf.get(t) || 0) + 1);
+
+    for (const [term, freq] of tf) {
+      if (!d.invertedIndex.has(term)) d.invertedIndex.set(term, new Map());
+      d.invertedIndex.get(term).set(id, freq);
+    }
+  }
+
+  removeDocument(col, id) {
+    const d = this._data.get(col);
+    if (!d || !d.docLengths.has(id)) return;
+
+    const dl = d.docLengths.get(id);
+    d.totalTokens -= dl;
+    d.docCount--;
+    d.docLengths.delete(id);
+
+    for (const [term, postings] of d.invertedIndex) {
+      postings.delete(id);
+      if (postings.size === 0) d.invertedIndex.delete(term);
+    }
+  }
+
+  count(col) { return this._data.has(col) ? this._data.get(col).docCount : 0; }
+
+  vocabularySize(col) {
+    return this._data.has(col) ? this._data.get(col).invertedIndex.size : 0;
+  }
+
+  /**
+   * Calcula BM25 scores para todos los docs contra un query.
+   * @returns {Map<string, number>} docId → score
+   */
+  scoreAll(col, query) {
+    const d = this._data.get(col);
+    if (!d || d.docCount === 0) return new Map();
+
+    const queryTokens = this.tokenizer.tokenize(query);
+    const N    = d.docCount;
+    const avgDl = d.totalTokens / N;
+    const scores = new Map();
+
+    for (const term of queryTokens) {
+      const postings = d.invertedIndex.get(term);
+      if (!postings) continue;
+
+      const df  = postings.size;
+      const idf = Math.log((N - df + 0.5) / (df + 0.5) + 1.0);
+
+      for (const [docId, tf] of postings) {
+        const dl     = d.docLengths.get(docId);
+        const tfNorm = (tf * (this.k1 + 1)) / (tf + this.k1 * (1 - this.b + this.b * dl / avgDl));
+        const score  = idf * tfNorm;
+        scores.set(docId, (scores.get(docId) || 0) + score);
+      }
+    }
+
+    return scores;
+  }
+
+  /**
+   * Busca los top-K documentos por BM25.
+   * @returns {{ id: string, score: number }[]}
+   */
+  search(col, query, limit = 10) {
+    const scores = this.scoreAll(col, query);
+    const heap = new TopKHeap(limit);
+    for (const [id, score] of scores) {
+      heap.push({ id, score });
+    }
+    return heap.sorted();
+  }
+
+  /** Exporta el estado para persistencia. */
+  exportState(col) {
+    const d = this._data.get(col);
+    if (!d) return null;
+    return {
+      totalTokens: d.totalTokens,
+      docCount:    d.docCount,
+      docLengths:  Object.fromEntries(d.docLengths),
+      invertedIndex: Object.fromEntries(
+        Array.from(d.invertedIndex).map(([term, postings]) =>
+          [term, Object.fromEntries(postings)]
+        )
+      ),
+    };
+  }
+
+  /** Importa estado desde persistencia. */
+  importState(col, state) {
+    const d = this._getCol(col);
+    d.totalTokens = state.totalTokens;
+    d.docCount    = state.docCount;
+    d.docLengths  = new Map(Object.entries(state.docLengths).map(([k, v]) => [k, v]));
+    d.invertedIndex = new Map(
+      Object.entries(state.invertedIndex).map(([term, postings]) =>
+        [term, new Map(Object.entries(postings).map(([k, v]) => [k, v]))]
+      )
+    );
+  }
+
+  /** Guarda a un adapter (compatible con el patron de los stores). */
+  save(adapter, col) {
+    const state = this.exportState(col);
+    if (state) adapter.writeJson(`${col}.bm25.json`, state);
+  }
+
+  /** Carga desde un adapter. */
+  load(adapter, col) {
+    const state = adapter.readJson(`${col}.bm25.json`);
+    if (state) this.importState(col, state);
+  }
+}
+
+// ---------------------------------------------------------------------------
+// HYBRID SEARCH (Vector + BM25 fusion)
+// ---------------------------------------------------------------------------
+// Dos modos de fusion:
+//   'rrf'      → Reciprocal Rank Fusion: score = sum(1/(k+rank)) por cada sistema
+//   'weighted' → Min-max normalize + weighted sum
+
+class HybridSearch {
+  /**
+   * @param {VectorStore|QuantizedStore|BinaryQuantizedStore} store
+   * @param {BM25Index} bm25
+   * @param {'rrf'|'weighted'} mode
+   */
+  constructor(store, bm25, mode = 'rrf') {
+    this.store = store;
+    this.bm25  = bm25;
+    this.mode  = mode;
+  }
+
+  /**
+   * Búsqueda híbrida: combina vector similarity + BM25 text relevance.
+   *
+   * @param {string} col         Colección
+   * @param {number[]} vector    Query vector (embedding)
+   * @param {string} text        Query text (para BM25)
+   * @param {number} [limit=5]
+   * @param {object} [opts]
+   * @param {number} [opts.vectorWeight=0.5]  Peso para vector (modo weighted)
+   * @param {number} [opts.textWeight=0.5]    Peso para BM25 (modo weighted)
+   * @param {number} [opts.rrfK=60]           K para RRF
+   * @param {number} [opts.fetchK]            Candidatos del vector search (default: max(limit*3,50))
+   * @param {string} [opts.metric='cosine']
+   */
+  search(col, vector, text, limit = 5, opts = {}) {
+    const vectorWeight = opts.vectorWeight ?? 0.5;
+    const textWeight   = opts.textWeight   ?? 0.5;
+    const rrfK         = opts.rrfK         ?? 60;
+    const fetchK       = opts.fetchK       ?? Math.max(limit * 3, 50);
+    const metric       = opts.metric       ?? 'cosine';
+
+    // 1. Vector search
+    const vecResults = this.store.search(col, vector, fetchK, 0, metric);
+
+    // 2. BM25 search
+    const bm25Scores = this.bm25.scoreAll(col, text);
+
+    // 3. Fusion
+    if (this.mode === 'rrf') {
+      return this._fuseRRF(vecResults, bm25Scores, limit, rrfK);
+    } else {
+      return this._fuseWeighted(vecResults, bm25Scores, limit, vectorWeight, textWeight);
+    }
+  }
+
+  /**
+   * Reciprocal Rank Fusion.
+   * score(d) = sum(1 / (k + rank_i)) para cada sistema donde d aparece
+   */
+  _fuseRRF(vecResults, bm25Scores, limit, rrfK) {
+    const fused = new Map(); // id → { score, metadata }
+
+    // Vector ranking
+    for (let r = 0; r < vecResults.length; r++) {
+      const v = vecResults[r];
+      const rrfScore = 1 / (rrfK + r + 1);
+      const entry = fused.get(v.id) || { score: 0, metadata: v.metadata };
+      entry.score += rrfScore;
+      fused.set(v.id, entry);
+    }
+
+    // BM25 ranking (ordenar por score para obtener rank)
+    const bm25Sorted = Array.from(bm25Scores.entries())
+      .sort((a, b) => b[1] - a[1]);
+
+    for (let r = 0; r < bm25Sorted.length; r++) {
+      const [id, _score] = bm25Sorted[r];
+      const rrfScore = 1 / (rrfK + r + 1);
+      const entry = fused.get(id) || { score: 0, metadata: {} };
+      entry.score += rrfScore;
+      fused.set(id, entry);
+    }
+
+    const heap = new TopKHeap(limit);
+    for (const [id, entry] of fused) {
+      heap.push({ id, score: Math.round(entry.score * 1e6) / 1e6, metadata: entry.metadata });
+    }
+    return heap.sorted();
+  }
+
+  /**
+   * Weighted fusion con min-max normalization.
+   */
+  _fuseWeighted(vecResults, bm25Scores, limit, vectorWeight, textWeight) {
+    // Normalizar vector scores a [0,1]
+    let vecMin = Infinity, vecMax = -Infinity;
+    for (const r of vecResults) {
+      if (r.score < vecMin) vecMin = r.score;
+      if (r.score > vecMax) vecMax = r.score;
+    }
+    const vecRange = vecMax - vecMin;
+
+    // Normalizar BM25 scores a [0,1]
+    let bm25Min = Infinity, bm25Max = -Infinity;
+    for (const [, s] of bm25Scores) {
+      if (s < bm25Min) bm25Min = s;
+      if (s > bm25Max) bm25Max = s;
+    }
+    const bm25Range = bm25Max - bm25Min;
+
+    // Fusionar
+    const fused = new Map();
+
+    for (const r of vecResults) {
+      const normVec = vecRange > 0 ? (r.score - vecMin) / vecRange : 1.0;
+      const normBm25 = bm25Scores.has(r.id)
+        ? (bm25Range > 0 ? (bm25Scores.get(r.id) - bm25Min) / bm25Range : 1.0)
+        : 0;
+      fused.set(r.id, {
+        score: vectorWeight * normVec + textWeight * normBm25,
+        metadata: r.metadata,
+      });
+    }
+
+    // Docs que estan en BM25 pero no en vector results
+    for (const [id, bm25Score] of bm25Scores) {
+      if (!fused.has(id)) {
+        const normBm25 = bm25Range > 0 ? (bm25Score - bm25Min) / bm25Range : 1.0;
+        fused.set(id, { score: textWeight * normBm25, metadata: {} });
+      }
+    }
+
+    const heap = new TopKHeap(limit);
+    for (const [id, entry] of fused) {
+      heap.push({ id, score: Math.round(entry.score * 1e6) / 1e6, metadata: entry.metadata });
+    }
+    return heap.sorted();
+  }
+
+  /**
+   * Búsqueda híbrida en múltiples colecciones.
+   */
+  searchAcross(collections, vector, text, limit = 5, opts = {}) {
+    const heap = new TopKHeap(limit);
+    for (const col of collections) {
+      const results = this.search(col, vector, text, limit, opts);
+      for (const r of results) {
+        heap.push({ ...r, collection: col });
+      }
+    }
+    return heap.sorted();
+  }
+}
+
+// ---------------------------------------------------------------------------
 // RERANKER (cross-encoder para búsqueda cross-model)
 // ---------------------------------------------------------------------------
 // Toma candidatos de múltiples stores/modelos, reranquea con un cross-encoder
@@ -1506,6 +1868,9 @@ module.exports = {
   QuantizedStore,
   BinaryQuantizedStore,
   IVFIndex,
+  BM25Index,
+  SimpleTokenizer,
+  HybridSearch,
   Reranker,
   FileStorageAdapter,
   MemoryStorageAdapter,
