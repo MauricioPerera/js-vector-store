@@ -401,6 +401,11 @@ Cada uno es un solo archivo JS, zero dependencias, corre en Node/browser/Workers
 - [Documentacion js-doc-store](https://github.com/MauricioPerera/js-doc-store)
 - [Documentacion server](server/README.md)
 
+### Proyectos que usan este repo
+
+- **[js-git-store](https://github.com/MauricioPerera/js-git-store)** — Adapter git-nativo para persistir las colecciones de este vector store en un repo git (tree-first, blob-on-demand, two-branch layout).
+- **[llm-wiki-kit](https://github.com/MauricioPerera/llm-wiki-kit)** — Wiki mantenida por LLM con retrieval en 3 capas (grep + BM25 + embeddings). Usa este vector store como capa 3 sobre un `js-git-store` adapter.
+
 ## Creditos
 
 Creado por [Mauricio Perera](https://www.linkedin.com/in/mauricioperera/)
