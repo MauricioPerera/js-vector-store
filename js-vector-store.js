@@ -346,6 +346,15 @@ class MemoryStorageAdapter {
   readJson(k)      { return this._jsons.get(k) ?? null; }
   writeJson(k, v)  { this._jsons.set(k, v); }
   delete(k)        { this._bins.delete(k); this._jsons.delete(k); }
+
+  /**
+   * Lists all keys (filenames) currently stored. Used by VectorStore.listCollections().
+   * Returns the union of bin and json keys, deduplicated.
+   * @returns {string[]}
+   */
+  listKeys() {
+    return [...new Set([...this._bins.keys(), ...this._jsons.keys()])];
+  }
 }
 
 // ---------------------------------------------------------------------------
@@ -358,12 +367,16 @@ class VectorStore {
    * @param {number} dim
    * @param {number} maxCollections
    * @param {object} [opts]
-   * @param {string} [opts.model]  Modelo de embeddings (se guarda en el manifest)
+   * @param {string} [opts.model]            Modelo de embeddings (se guarda en el manifest)
+   * @param {string} [opts.collectionPrefix] Prefix prepended to all collection filenames.
+   *   Useful for multi-tenant scenarios (e.g. 'tenant_alpha/'). Default: '' (no prefix).
+   *   When set, `listCollections()` and `dropAll()` only see collections under this prefix.
    */
   constructor(dirOrAdapter, dim = 768, maxCollections = 50, opts = {}) {
     this.dim           = dim;
     this.maxCollections = maxCollections;
     this.defaultModel  = opts.model || null;
+    this.collectionPrefix = opts.collectionPrefix || '';
     this._adapter      = typeof dirOrAdapter === 'string'
       ? new FileStorageAdapter(dirOrAdapter)
       : dirOrAdapter;
@@ -371,8 +384,46 @@ class VectorStore {
     this._stride = dim * 4;
   }
 
-  _binFile(col)  { return `${col}.bin`; }
-  _jsonFile(col) { return `${col}.json`; }
+  _binFile(col)  { return `${this.collectionPrefix}${col}.bin`; }
+  _jsonFile(col) { return `${this.collectionPrefix}${col}.json`; }
+
+  /**
+   * Lists collections that exist in storage under this store's prefix.
+   * Requires the adapter to implement `listKeys()` (CloudflareKVAdapter has it;
+   * FileStorageAdapter falls back to `_collections` map of loaded collections).
+   *
+   * @returns {Promise<string[]>} Collection names (without prefix or .bin/.json suffix).
+   */
+  async listCollections() {
+    // If adapter supports listKeys, enumerate from storage
+    if (typeof this._adapter.listKeys === 'function') {
+      const keys = await this._adapter.listKeys();
+      const prefix = this.collectionPrefix;
+      const names = new Set();
+      for (const k of keys) {
+        // Only consider keys matching our prefix
+        if (prefix && !k.startsWith(prefix)) continue;
+        const stripped = prefix ? k.slice(prefix.length) : k;
+        // Match {collection}.json or {collection}.bin (skip other extensions)
+        const m = /^(.+?)\.(json|bin)$/.exec(stripped);
+        if (m) names.add(m[1]);
+      }
+      return [...names].sort();
+    }
+    // Fallback: only collections currently loaded in memory
+    return [...this._collections.keys()].sort();
+  }
+
+  /**
+   * Deletes all collections under this store's prefix.
+   * Useful for tenant cleanup. Removes both .bin and .json files.
+   * @returns {Promise<string[]>} Names of dropped collections.
+   */
+  async dropAll() {
+    const cols = await this.listCollections();
+    for (const col of cols) this.drop(col);
+    return cols;
+  }
 
   _load(col) {
     if (this._collections.has(col)) return this._collections.get(col);
@@ -1713,6 +1764,31 @@ class CloudflareKVAdapter {
       }
     });
     await Promise.all(promises);
+  }
+
+  /**
+   * Lists all KV keys under this adapter's prefix. Paginates internally.
+   * Used by `VectorStore.listCollections()` to discover collections without
+   * the caller having to know names ahead of time.
+   * @returns {Promise<string[]>} Filenames without the adapter prefix.
+   */
+  async listKeys() {
+    const result = [];
+    let cursor;
+    do {
+      const list = await this.kv.list({ prefix: this.prefix, cursor });
+      for (const k of list.keys) {
+        if (this.prefix) {
+          if (k.name.startsWith(this.prefix)) {
+            result.push(k.name.slice(this.prefix.length));
+          }
+        } else {
+          result.push(k.name);
+        }
+      }
+      cursor = list.list_complete ? undefined : list.cursor;
+    } while (cursor);
+    return result;
   }
 
   readBin(filename) {
