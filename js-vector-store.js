@@ -626,17 +626,54 @@ class VectorStore {
 // ---------------------------------------------------------------------------
 
 class QuantizedStore {
+  /**
+   * @param {string|object} dirOrAdapter
+   * @param {number} dim
+   * @param {object} [opts]
+   * @param {string} [opts.model]            Modelo de embeddings (se guarda en el manifest)
+   * @param {string} [opts.collectionPrefix] Prefix prepended to all collection filenames
+   *   (e.g. 'tenant_a/'). Default: '' (no prefix). See VectorStore for usage pattern.
+   */
   constructor(dirOrAdapter, dim = 768, opts = {}) {
     this.dim          = dim;
     this.defaultModel = opts.model || null;
+    this.collectionPrefix = opts.collectionPrefix || '';
     this._adapter = typeof dirOrAdapter === 'string'
       ? new FileStorageAdapter(dirOrAdapter)
       : dirOrAdapter;
     this._collections = new Map();
   }
 
-  _binFile(col)  { return `${col}.q8.bin`; }
-  _jsonFile(col) { return `${col}.q8.json`; }
+  _binFile(col)  { return `${this.collectionPrefix}${col}.q8.bin`; }
+  _jsonFile(col) { return `${this.collectionPrefix}${col}.q8.json`; }
+
+  /**
+   * Lists collections under this store's prefix. Requires `adapter.listKeys()`
+   * (CloudflareKVAdapter and MemoryStorageAdapter implement it).
+   * @returns {Promise<string[]>}
+   */
+  async listCollections() {
+    if (typeof this._adapter.listKeys === 'function') {
+      const keys = await this._adapter.listKeys();
+      const prefix = this.collectionPrefix;
+      const names = new Set();
+      for (const k of keys) {
+        if (prefix && !k.startsWith(prefix)) continue;
+        const stripped = prefix ? k.slice(prefix.length) : k;
+        const m = /^(.+?)\.q8\.(json|bin)$/.exec(stripped);
+        if (m) names.add(m[1]);
+      }
+      return [...names].sort();
+    }
+    return [...this._collections.keys()].sort();
+  }
+
+  /** Deletes all collections under this store's prefix. */
+  async dropAll() {
+    const cols = await this.listCollections();
+    for (const col of cols) this.drop(col);
+    return cols;
+  }
   get _stride() { return 8 + this.dim; }
 
   _load(col) {
@@ -863,9 +900,17 @@ class QuantizedStore {
 // Similitud via Hamming: cosine_approx = 1.0 - 2.0 * hamming / dims
 
 class BinaryQuantizedStore {
+  /**
+   * @param {string|object} dirOrAdapter
+   * @param {number} dim
+   * @param {object} [opts]
+   * @param {string} [opts.model]            Modelo de embeddings (se guarda en el manifest)
+   * @param {string} [opts.collectionPrefix] Prefix prepended to filenames (multi-tenant). Default: ''.
+   */
   constructor(dirOrAdapter, dim = 768, opts = {}) {
     this.dim          = dim;
     this.defaultModel = opts.model || null;
+    this.collectionPrefix = opts.collectionPrefix || '';
     this._bpv     = Math.ceil(dim / 8); // bytes per vector
     this._adapter = typeof dirOrAdapter === 'string'
       ? new FileStorageAdapter(dirOrAdapter)
@@ -873,8 +918,32 @@ class BinaryQuantizedStore {
     this._collections = new Map();
   }
 
-  _binFile(col)  { return `${col}.b1.bin`; }
-  _jsonFile(col) { return `${col}.b1.json`; }
+  _binFile(col)  { return `${this.collectionPrefix}${col}.b1.bin`; }
+  _jsonFile(col) { return `${this.collectionPrefix}${col}.b1.json`; }
+
+  /** Lists collections under this store's prefix. See VectorStore.listCollections. */
+  async listCollections() {
+    if (typeof this._adapter.listKeys === 'function') {
+      const keys = await this._adapter.listKeys();
+      const prefix = this.collectionPrefix;
+      const names = new Set();
+      for (const k of keys) {
+        if (prefix && !k.startsWith(prefix)) continue;
+        const stripped = prefix ? k.slice(prefix.length) : k;
+        const m = /^(.+?)\.b1\.(json|bin)$/.exec(stripped);
+        if (m) names.add(m[1]);
+      }
+      return [...names].sort();
+    }
+    return [...this._collections.keys()].sort();
+  }
+
+  /** Deletes all collections under this store's prefix. */
+  async dropAll() {
+    const cols = await this.listCollections();
+    for (const col of cols) this.drop(col);
+    return cols;
+  }
 
   _load(col) {
     if (this._collections.has(col)) return this._collections.get(col);
@@ -1174,9 +1243,10 @@ class PolarQuantizedStore {
    * @param {string|object} dirOrAdapter
    * @param {number} dim  Debe ser par
    * @param {object} [opts]
-   * @param {number} [opts.bits=3]     Bits por angulo (2-8)
-   * @param {number} [opts.seed=42]    Seed para la rotacion determinista
-   * @param {string} [opts.model]      Modelo de embeddings
+   * @param {number} [opts.bits=3]           Bits por angulo (2-8)
+   * @param {number} [opts.seed=42]          Seed para la rotacion determinista
+   * @param {string} [opts.model]            Modelo de embeddings
+   * @param {string} [opts.collectionPrefix] Prefix prepended to filenames (multi-tenant). Default: ''.
    */
   constructor(dirOrAdapter, dim = 768, opts = {}) {
     if (dim % 2 !== 0) throw new Error('PolarQuantizedStore: dim must be even');
@@ -1184,6 +1254,7 @@ class PolarQuantizedStore {
     this.bits         = opts.bits || 3;
     this.seed         = opts.seed ?? 42;
     this.defaultModel = opts.model || null;
+    this.collectionPrefix = opts.collectionPrefix || '';
     this._levels      = 1 << this.bits; // 2^bits = 8 para 3 bits
     this._pairs       = dim / 2;
     this._bitsPerVec  = this._pairs * this.bits;
@@ -1206,8 +1277,32 @@ class PolarQuantizedStore {
     this._rotation = this._generateRotation(dim, this.seed);
   }
 
-  _binFile(col)  { return `${col}.p3.bin`; }
-  _jsonFile(col) { return `${col}.p3.json`; }
+  _binFile(col)  { return `${this.collectionPrefix}${col}.p3.bin`; }
+  _jsonFile(col) { return `${this.collectionPrefix}${col}.p3.json`; }
+
+  /** Lists collections under this store's prefix. See VectorStore.listCollections. */
+  async listCollections() {
+    if (typeof this._adapter.listKeys === 'function') {
+      const keys = await this._adapter.listKeys();
+      const prefix = this.collectionPrefix;
+      const names = new Set();
+      for (const k of keys) {
+        if (prefix && !k.startsWith(prefix)) continue;
+        const stripped = prefix ? k.slice(prefix.length) : k;
+        const m = /^(.+?)\.p3\.(json|bin)$/.exec(stripped);
+        if (m) names.add(m[1]);
+      }
+      return [...names].sort();
+    }
+    return [...this._collections.keys()].sort();
+  }
+
+  /** Deletes all collections under this store's prefix. */
+  async dropAll() {
+    const cols = await this.listCollections();
+    for (const col of cols) this.drop(col);
+    return cols;
+  }
 
   /** PRNG determinista (xorshift32) */
   _xorshift(state) {
