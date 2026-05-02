@@ -1,5 +1,7 @@
 # js-vector-store
 
+[![npm](https://img.shields.io/npm/v/js-vector-store)](https://www.npmjs.com/package/js-vector-store)
+
 Port vanilla JS de [php-vector-store](https://github.com/MauricioPerera/php-vector-store). Zero dependencias — funciona en Node.js y browser (con adaptador de storage).
 
 ## Caracteristicas
@@ -18,7 +20,12 @@ Port vanilla JS de [php-vector-store](https://github.com/MauricioPerera/php-vect
 ## Instalacion
 
 ```bash
-# Copiar el archivo directamente
+npm install js-vector-store
+```
+
+O copiar el archivo directamente:
+
+```bash
 cp js-vector-store.js tu-proyecto/
 ```
 
@@ -35,7 +42,7 @@ const {
   cosineSim,
   computeScore,
   manhattanDist,
-} = require('./js-vector-store');
+} = require('js-vector-store');
 ```
 
 ## Quick Start
@@ -387,18 +394,23 @@ Coleccion "articles"
 
 ## Ecosistema
 
-Este repo contiene tres modulos independientes que comparten storage adapters:
+js-vector-store forma parte de un stack completo para agentes LLM:
+
+| Paquete | npm | Descripcion |
+|---------|-----|-------------|
+| **[js-doc-store](https://github.com/MauricioPerera/js-doc-store)** | [![npm](https://img.shields.io/npm/v/js-doc-store)](https://www.npmjs.com/package/js-doc-store) | Document database: CRUD, queries, indices, joins, aggregation, auth, encriptacion |
+| **js-vector-store** | [![npm](https://img.shields.io/npm/v/js-vector-store)](https://www.npmjs.com/package/js-vector-store) | Vector database para busqueda semantica (este paquete) |
+| **[just-bash-data](https://github.com/MauricioPerera/just-bash-data)** | [![npm](https://img.shields.io/npm/v/just-bash-data)](https://www.npmjs.com/package/just-bash-data) | Plugin [just-bash](https://github.com/vercel-labs/just-bash): expone `db` y `vec` como comandos shell para agentes LLM |
+| **[just-bash-wiki](https://github.com/MauricioPerera/just-bash-wiki)** | [![npm](https://img.shields.io/npm/v/just-bash-wiki)](https://www.npmjs.com/package/just-bash-wiki) | Wiki persistente mantenido por LLMs ([Karpathy's LLM Wiki pattern](https://gist.github.com/karpathy/442a6bf555914893e9891c11519de94f)) |
+
+Cada modulo es un solo archivo JS, zero dependencias, corre en Node/browser/Workers/Deno.
+
+### Modulos adicionales en este repo
 
 | Modulo | Archivo | Que hace |
 |---|---|---|
-| **js-vector-store** | `js-vector-store.js` | Busqueda semantica: embeddings, similarity, IVF, Matryoshka, reranking |
-| **[js-doc-store](https://github.com/MauricioPerera/js-doc-store)** | Repo separado | Document database: CRUD, queries, indices, joins, aggregation, auth, encriptacion |
 | **js-vector-server** | `server/` | REST API sobre Cloudflare Workers + KV |
 
-Cada uno es un solo archivo JS, zero dependencias, corre en Node/browser/Workers/Deno.
-
-- [Documentacion js-vector-store](README.md) (este archivo)
-- [Documentacion js-doc-store](https://github.com/MauricioPerera/js-doc-store)
 - [Documentacion server](server/README.md)
 
 ## Creditos
