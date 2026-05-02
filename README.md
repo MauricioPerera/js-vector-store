@@ -171,6 +171,8 @@ const results = store.search('docs', queryVec, 5);
 
 **Search**: Calcula coseno directamente en espacio polar rotado — sin dequantizar.
 
+> ⚠️ **Nota sobre `matryoshkaSearch`**: el cascade matryoshka **dequantiza a Float32 internamente** en cada stage porque la rotacion polar reordena dimensiones — el truco "prefix de dims" no aplica directo. El cascade sigue filtrando candidatos pero no ganas el speedup que sí obtienes con `VectorStore` (Float32) o `QuantizedStore` (Int8). Para throughput maximo en indices polar grandes, prefiere `search()` flat o un patron coarse-then-fine con `BinaryQuantizedStore` como pre-filtro. Para silenciar el warning: `new PolarQuantizedStore(..., { silent: true })`.
+
 **Bits configurables**:
 
 | Bits | Bytes/vec (768d) | Compresion | Top-1 | Recall@5 |

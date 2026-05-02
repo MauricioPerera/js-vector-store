@@ -1133,6 +1133,7 @@ class PolarQuantizedStore {
     this.bits         = opts.bits || 3;
     this.seed         = opts.seed ?? 42;
     this.defaultModel = opts.model || null;
+    this.silent       = !!opts.silent;
     this._levels      = 1 << this.bits; // 2^bits = 8 para 3 bits
     this._pairs       = dim / 2;
     this._bitsPerVec  = this._pairs * this.bits;
@@ -1141,6 +1142,7 @@ class PolarQuantizedStore {
       ? new FileStorageAdapter(dirOrAdapter)
       : dirOrAdapter;
     this._collections = new Map();
+    this._warnedMatryoshka = false;
 
     // Precomputar tabla de cos/sin para los niveles de cuantizacion
     this._cosTable = new Float64Array(this._levels);
@@ -1438,12 +1440,39 @@ class PolarQuantizedStore {
     return heap.sorted();
   }
 
+  /**
+   * Matryoshka multi-stage search.
+   *
+   * IMPORTANT: PolarQuantizedStore packs vectors as quantized angles in a
+   * rotated frame, which means the prefix-of-dimensions trick that makes
+   * matryoshka cheap on Float32 doesn't apply directly. This implementation
+   * dequantizes to Float32 internally on each stage — the cascade still
+   * filters candidates progressively but you do NOT get the speedup that
+   * matryoshka delivers on `VectorStore` (Float32) or `QuantizedStore` (Int8).
+   *
+   * For maximum throughput on large polar-quantized indexes, prefer:
+   *   1. `search()` (single-stage flat) over the polar store, OR
+   *   2. A coarse-then-fine pattern: BinaryQuantizedStore for stage 1
+   *      (pre-filter via Hamming distance), PolarQuantizedStore for refine.
+   *
+   * Pass `{ silent: true }` to the constructor to suppress this warning.
+   */
   matryoshkaSearch(col, query, limit = 5, stages = [128, 384, 768], metric = 'cosine') {
     const entry = this._load(col);
     if (entry.ids.length === 0) return [];
     if (entry.pending.length > 0) this._flushCol(col, entry);
 
-    // Matryoshka no aplica bien con rotacion polar — fallback a dequantize + cosine
+    // One-shot warning (deduplicated per instance) so users know about
+    // the dequantize fallback. Suppress with `new PolarQuantizedStore(..., { silent: true })`.
+    if (!this._warnedMatryoshka && !this.silent && typeof console !== 'undefined' && console.warn) {
+      this._warnedMatryoshka = true;
+      console.warn(
+        '[PolarQuantizedStore] matryoshkaSearch dequantizes to Float32 per stage — ' +
+        'no speedup over flat search. See JSDoc for alternatives. ' +
+        'Suppress: new PolarQuantizedStore(..., { silent: true }).'
+      );
+    }
+
     const factor = 4;
     let candidates = entry.ids.map((id, i) => ({ id, idx: i, metadata: entry.meta[i] }));
 
