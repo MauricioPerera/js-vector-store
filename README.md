@@ -36,10 +36,16 @@ const {
   PolarQuantizedStore,
   BinaryQuantizedStore,
   IVFIndex,
+  BM25Index,
+  HybridSearch,
+  Reranker,
+  SimpleTokenizer,
   MemoryStorageAdapter,
   FileStorageAdapter,
+  CloudflareKVAdapter,
   normalize,
   cosineSim,
+  euclideanDist,
   computeScore,
   manhattanDist,
 } = require('js-vector-store');
@@ -323,6 +329,69 @@ store.matryoshkaSearch('docs', query, 5, [128, 384, 768]);
 | > 100,000 | 100-500 | 10-50 | Mas clusters, mas probes |
 
 **Regla general**: `K ≈ sqrt(N)`, `P ≈ K * 0.1` a `K * 0.2`
+
+## BM25 Index (text search)
+
+Indice invertido con Okapi BM25 scoring para busqueda lexica:
+
+```js
+const bm25 = new BM25Index({ k1: 1.5, b: 0.75 });
+
+bm25.addDocument('docs', 'doc-1', 'Machine learning is a subset of AI');
+bm25.addDocument('docs', 'doc-2', 'Deep learning uses neural networks');
+
+const results = bm25.search('docs', 'neural networks', 5);
+// [{ id: 'doc-2', score: 1.23 }]
+```
+
+| Metodo | Descripcion |
+|---|---|
+| `addDocument(col, id, text)` | Indexa un documento |
+| `removeDocument(col, id)` | Remueve un documento |
+| `search(col, query, limit?)` | Top-K por BM25 |
+| `scoreAll(col, query)` | Map de id → score |
+| `count(col)` | Cantidad de documentos |
+| `vocabularySize(col)` | Cantidad de terminos unicos |
+| `save(adapter, col)` | Persiste a adapter |
+| `load(adapter, col)` | Carga desde adapter |
+
+`SimpleTokenizer` se usa por default (tokeniza, lowercase, stopwords en/es). Se puede pasar un tokenizer custom con `.tokenize(text)`.
+
+## HybridSearch (Vector + BM25 fusion)
+
+Combina vector similarity con BM25 text relevance:
+
+```js
+const hybrid = new HybridSearch(store, bm25, 'rrf');
+
+// Busqueda con query vector + query text
+const results = hybrid.search('docs', queryVector, 'neural networks', 5, {
+  vectorWeight: 0.6,   // para modo 'weighted'
+  textWeight: 0.4,
+  rrfK: 60,            // para modo 'rrf'
+});
+// [{ id: 'doc-2', score: 0.032, metadata: {...} }]
+```
+
+Modos de fusion:
+- **`rrf`** (Reciprocal Rank Fusion): `score = sum(1/(k+rank))` por sistema. Robusto, no requiere calibracion.
+- **`weighted`**: min-max normaliza scores, luego `vectorWeight * vecScore + textWeight * bm25Score`.
+
+Tambien soporta `searchAcross(collections, vector, text, limit, opts)` para multi-collection.
+
+## Reranker
+
+Cross-encoder para re-ranking de candidatos via API externa:
+
+```js
+const reranker = new Reranker({
+  apiUrl: 'https://api.cloudflare.com/...',
+  apiToken: 'Bearer ...',
+  model: '@cf/baai/bge-reranker-base',
+});
+
+const reranked = await reranker.rerank(query, candidates, limit);
+```
 
 ## Benchmark
 
