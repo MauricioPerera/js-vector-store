@@ -110,6 +110,40 @@ const qVec = await embed('inteligencia artificial en salud');
 const results = store.search('docs', qVec, 5);
 ```
 
+
+### Con embeddings reales — OpenAI SDK + openai-workers-ai-bridge
+
+Si despliegas el [bridge OpenAI-compat](https://github.com/MauricioPerera/openai-workers-ai-bridge) en tu cuenta de Cloudflare obtienes una URL `/v1` que cualquier cliente OpenAI consume. El bridge ademas hace **truncacion Matryoshka + L2-renormalizacion** del lado del servidor cuando pides el parametro `dimensions`, asi que los vectores entran a `js-vector-store` listos para coseno sin renormalizar manualmente.
+
+```js
+import OpenAI from "openai";
+
+const client = new OpenAI({
+  apiKey: process.env.WORKERS_AI_KEY,
+  baseURL: "https://openai-workers-ai-bridge.<your-subdomain>.workers.dev/v1",
+});
+
+async function embed(texts) {
+  const res = await client.embeddings.create({
+    model: "embeddinggemma",
+    input: texts,
+    dimensions: 256,   // Matryoshka: el bridge trunca + renormaliza
+  });
+  return res.data.map((d) => d.embedding);
+}
+
+const store = new QuantizedStore(new MemoryStorageAdapter(), 256);
+const docs = ["doc1...", "doc2..."];
+const vecs = await embed(docs);
+docs.forEach((t, i) => store.set("docs", `id-${i}`, vecs[i], { text: t }));
+store.flush();
+
+const [q] = await embed(["query..."]);
+const results = store.matryoshkaSearch("docs", q, 5, [128, 256]);
+```
+
+El bridge cachea embeddings idempotentes en el edge, asi que llamadas repetidas con el mismo texto cuestan 0 neuronas. Ver [openai-workers-ai-bridge/examples/rag-with-js-vector-store.mjs](https://github.com/MauricioPerera/openai-workers-ai-bridge/blob/main/examples/rag-with-js-vector-store.mjs) para un demo end-to-end ejecutable.
+
 ## API
 
 ### VectorStore
