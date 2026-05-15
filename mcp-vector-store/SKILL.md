@@ -73,6 +73,8 @@ Si hay multiples colecciones (docs, faqs, articles):
 
 - Activa commits automaticos con `GIT_STORAGE=1`. La metadata JSON se commitea automaticamente en cada persistencia.
 - Personaliza el mensaje con `GIT_COMMIT_MESSAGE`.
+- **Auto-push**: `GIT_AUTO_PUSH=1` empuja automaticamente al remote despues de cada commit. Configura `GIT_PUSH_REMOTE` (default: origin) y `GIT_PUSH_BRANCH` (default: master).
+- **Batch commits**: `GIT_BATCH_INTERVAL=300` acumula cambios y commitea cada 300 segundos. Default: 0 (inmediato).
 - Los vectores binarios (.bin) tambien se trackean si estan en el mismo directorio.
 
 ## Limitaciones

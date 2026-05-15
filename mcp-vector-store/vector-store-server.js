@@ -34,6 +34,10 @@ const ENCRYPTION_KEY = process.env.ENCRYPTION_KEY || null;
 
 const GIT_STORAGE = process.env.GIT_STORAGE === "1" || process.env.GIT_STORAGE === "true";
 const GIT_COMMIT_MESSAGE = process.env.GIT_COMMIT_MESSAGE || null;
+const GIT_AUTO_PUSH = process.env.GIT_AUTO_PUSH === "1" || process.env.GIT_AUTO_PUSH === "true";
+const GIT_PUSH_REMOTE = process.env.GIT_PUSH_REMOTE || "origin";
+const GIT_PUSH_BRANCH = process.env.GIT_PUSH_BRANCH || "master";
+const GIT_BATCH_INTERVAL = parseInt(process.env.GIT_BATCH_INTERVAL || "0", 10) * 1000;
 
 async function getAdapter(name) {
   if (adapters.has(name)) return adapters.get(name);
@@ -45,6 +49,8 @@ async function getAdapter(name) {
   if (GIT_STORAGE) {
     const opts = { repoPath: dir };
     if (GIT_COMMIT_MESSAGE) opts.commitMessage = GIT_COMMIT_MESSAGE;
+    if (GIT_AUTO_PUSH) { opts.autoPush = true; opts.pushRemote = GIT_PUSH_REMOTE; opts.pushBranch = GIT_PUSH_BRANCH; }
+    if (GIT_BATCH_INTERVAL > 0) opts.batchIntervalMs = GIT_BATCH_INTERVAL;
     const adapter = new GitStorageAdapter(inner, opts);
     adapters.set(name, adapter);
     return adapter;
