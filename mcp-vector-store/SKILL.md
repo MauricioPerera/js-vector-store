@@ -64,6 +64,17 @@ Si hay multiples colecciones (docs, faqs, articles):
 - Activa encriptacion de metadata con la variable de entorno ENCRYPTION_KEY. Los archivos JSON (metadata de colecciones) se encriptan con AES-256-GCM via PBKDF2; los vectores binarios (.bin) permanecen sin encriptar por rendimiento.
 - ector_collection_create acepta encrypted: true para marcar la coleccion como sensible.
 
+## Encriptacion
+
+- Activa encriptacion de metadata con la variable de entorno `ENCRYPTION_KEY`. Los archivos JSON (metadata de colecciones) se encriptan con AES-256-GCM via PBKDF2; los vectores binarios (.bin) permanecen sin encriptar por rendimiento.
+- `vector_collection_create` acepta `encrypted: true` para marcar la coleccion como sensible.
+
+## Git Storage (versionado)
+
+- Activa commits automaticos con `GIT_STORAGE=1`. La metadata JSON se commitea automaticamente en cada persistencia.
+- Personaliza el mensaje con `GIT_COMMIT_MESSAGE`.
+- Los vectores binarios (.bin) tambien se trackean si estan en el mismo directorio.
+
 ## Limitaciones
 
 - No genera embeddings por si mismo: requiere Ollama corriendo

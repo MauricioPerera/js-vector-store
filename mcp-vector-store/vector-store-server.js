@@ -4,7 +4,7 @@ const z = require("zod/v4");
 const path = require("path");
 
 const { VectorStore, QuantizedStore, BinaryQuantizedStore, BM25Index, HybridSearch, MemoryStorageAdapter, FileStorageAdapter } = require(path.join(__dirname, "js-vector-store.js"));
-const { EncryptedAdapter } = require(path.join(__dirname, "..", "js-doc-store", "js-doc-store.js"));
+const { EncryptedAdapter, GitStorageAdapter } = require(path.join(__dirname, "..", "js-doc-store", "js-doc-store.js"));
 
 const OLLAMA_HOST = process.env.OLLAMA_HOST || "http://localhost:11434";
 const OLLAMA_MODEL = process.env.OLLAMA_MODEL || "embeddinggemma:latest";
@@ -32,12 +32,20 @@ const bm25s = new Map();
 const hybrids = new Map();
 const ENCRYPTION_KEY = process.env.ENCRYPTION_KEY || null;
 
+const GIT_STORAGE = process.env.GIT_STORAGE === "1" || process.env.GIT_STORAGE === "true";
+const GIT_COMMIT_MESSAGE = process.env.GIT_COMMIT_MESSAGE || null;
+
 async function getAdapter(name) {
   if (adapters.has(name)) return adapters.get(name);
   const dir = path.join(DATA_DIR, name);
-  const inner = new FileStorageAdapter(dir);
+  let inner = new FileStorageAdapter(dir);
   if (ENCRYPTION_KEY) {
-    const adapter = await EncryptedAdapter.create(inner, ENCRYPTION_KEY);
+    inner = await EncryptedAdapter.create(inner, ENCRYPTION_KEY);
+  }
+  if (GIT_STORAGE) {
+    const opts = { repoPath: dir };
+    if (GIT_COMMIT_MESSAGE) opts.commitMessage = GIT_COMMIT_MESSAGE;
+    const adapter = new GitStorageAdapter(inner, opts);
     adapters.set(name, adapter);
     return adapter;
   }
