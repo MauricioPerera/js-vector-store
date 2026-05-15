@@ -121,6 +121,8 @@ async function getCollection(name, dim = 768, backend = "float32") {
   if (backend === "binary") store = new BinaryQuantizedStore(adapter, dim);
   else if (backend === "int8") store = new QuantizedStore(adapter, dim);
   else store = new VectorStore(adapter, dim);
+  const bm25 = getBM25(name);
+  try { bm25.load(adapter, name); } catch {}
   collections.set(name, store);
   return store;
 }
@@ -128,6 +130,15 @@ async function getCollection(name, dim = 768, backend = "float32") {
 async function persistStore(store) {
   store.flush();
   const adapter = store._adapter;
+  for (const [n, st] of collections) {
+    if (st === store) {
+      const bm25 = bm25s.get(n);
+      if (bm25) {
+        try { bm25.save(adapter, n); } catch {}
+      }
+      break;
+    }
+  }
   if (adapter && typeof adapter.persist === 'function') {
     await adapter.persist();
   }
@@ -212,6 +223,10 @@ server.tool("vector_index", "Index a pre-computed embedding vector directly. Use
   metadata: z.record(z.any()).optional().describe("Optional metadata.")
 }, async (args) => {
   const store = await getCollection(args.collection, args.vector.length);
+  const bm25 = bm25s.get(args.collection);
+  if (bm25 && args.metadata && args.metadata.text) {
+    bm25.addDocument(args.collection, args.id, args.metadata.text);
+  }
   store.set(args.collection, args.id, args.vector, args.metadata);
   await persistStore(store);
   return { content: [{ type: "text", text: JSON.stringify({ indexed: args.id, collection: args.collection, dim: args.vector.length }, null, 2) }] };
