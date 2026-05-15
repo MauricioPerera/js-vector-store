@@ -1,0 +1,46 @@
+﻿{
+  "name": "js-vector-store-headless",
+  "version": "1.0.0",
+  "description": "Headless semantic search API powered by js-vector-store and local Ollama embeddings. Vector + BM25 + Hybrid search with MCP and REST endpoints.",
+  "main": "vector-api-server.js",
+  "bin": {
+    "js-vector-store-headless": "./bin/cli.js"
+  },
+  "scripts": {
+    "start": "node vector-api-server.js",
+    "start:mcp": "node vector-store-server.js"
+  },
+  "keywords": [
+    "vector-search",
+    "semantic-search",
+    "embeddings",
+    "ollama",
+    "bm25",
+    "hybrid-search",
+    "rag",
+    "mcp",
+    "headless",
+    "vanilla-js"
+  ],
+  "author": "MauricioPerera",
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/MauricioPerera/js-vector-store"
+  },
+  "engines": {
+    "node": ">=18.0.0"
+  },
+  "dependencies": {
+    "@modelcontextprotocol/sdk": "^1.29.0",
+    "zod": "^3.0.0"
+  },
+  "files": [
+    "js-vector-store.js",
+    "vector-store-server.js",
+    "vector-api-server.js",
+    "bin/cli.js",
+    "SKILL.md",
+    "README.md"
+  ]
+}
