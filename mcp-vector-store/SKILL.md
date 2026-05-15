@@ -78,6 +78,19 @@ Si hay multiples colecciones (docs, faqs, articles):
 - **Ignore binarios**: `GIT_IGNORE_BIN=1` ignora `*.bin` y `*.vec` en git. Recomendado para vector stores donde los archivos binarios son grandes.
 - Los vectores binarios (.bin) tambien se trackean si estan en el mismo directorio (a menos que actives `GIT_IGNORE_BIN=1`).
 
+## IVF Clustering (K-means)
+
+Para colecciones grandes (miles de vectores), construye un indice IVF para busqueda aproximada mas rapida:
+
+1. `vector_collection_build_ivf` - Agrupa los vectores en clusters (K-means) y guarda los centroides.
+2. `vector_collection_search_ivf` - Busca usando el indice IVF: filtra por los clusters mas cercanos al query.
+3. `vector_collection_cluster_info` - Obtiene estadisticas de clusters: tamanos, documentos de muestra por cluster.
+
+Parametros clave:
+- `numClusters`: cuantos clusters crear (default 100). Mas clusters = mas rapido, mas memoria.
+- `numProbes`: cuantos clusters explorar por query (default 10). Mas probes = mejor recall, mas lento.
+- `sampleDims`: dimensiones a muestrear para clustering (default: dimension completa).
+
 ## Limitaciones
 
 - No genera embeddings por si mismo: requiere Ollama corriendo

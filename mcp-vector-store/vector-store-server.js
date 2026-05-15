@@ -3,7 +3,7 @@ const { StdioServerTransport } = require("@modelcontextprotocol/sdk/server/stdio
 const z = require("zod/v4");
 const path = require("path");
 
-const { VectorStore, QuantizedStore, BinaryQuantizedStore, BM25Index, HybridSearch, MemoryStorageAdapter, FileStorageAdapter } = require(path.join(__dirname, "js-vector-store.js"));
+const { VectorStore, QuantizedStore, BinaryQuantizedStore, BM25Index, HybridSearch, MemoryStorageAdapter, FileStorageAdapter, IVFIndex } = require(path.join(__dirname, "js-vector-store.js"));
 const { EncryptedAdapter, GitStorageAdapter } = require(path.join(__dirname, "..", "js-doc-store", "js-doc-store.js"));
 
 const OLLAMA_HOST = process.env.OLLAMA_HOST || "http://localhost:11434";
@@ -30,6 +30,7 @@ const collections = new Map();
 const adapters = new Map();
 const bm25s = new Map();
 const hybrids = new Map();
+const ivfIndexes = new Map();
 const ENCRYPTION_KEY = process.env.ENCRYPTION_KEY || null;
 
 const GIT_STORAGE = process.env.GIT_STORAGE === "1" || process.env.GIT_STORAGE === "true";
@@ -95,6 +96,12 @@ async function getHybrid(name) {
     hybrids.set(name, new HybridSearch(store, bm25, "rrf"));
   }
   return hybrids.get(name);
+}
+
+
+function getIVF(name) {
+  if (!ivfIndexes.has(name)) ivfIndexes.set(name, new IVFIndex(null, 100, 10));
+  return ivfIndexes.get(name);
 }
 
 server.tool("vector_collection_create", "Create a new vector collection. Choose backend based on size requirements: float32 for accuracy, int8 for ~4x compression, binary for ~32x compression.", {
@@ -245,6 +252,60 @@ server.tool("vector_remove", "Remove a document by ID from both the vector store
   return { content: [{ type: "text", text: JSON.stringify({ removed: args.id, success: removed }, null, 2) }] };
 });
 
+server.tool("vector_collection_build_ivf", "Build an IVF (K-means) approximate search index on a vector collection. This accelerates semantic search for large collections by clustering vectors into centroids and searching only nearby clusters. Use when a collection has more than ~1000 vectors and search latency matters.", {
+  collection: z.string().describe("Collection name."),
+  numClusters: z.number().min(2).max(1000).default(100).describe("Number of K-means clusters. More clusters = faster search, more memory."),
+  numProbes: z.number().min(1).max(100).default(10).describe("How many clusters to search per query. More probes = higher recall, slower search."),
+  sampleDims: z.number().min(1).max(4096).optional().describe("Optional: subsample dimensions for faster clustering. Default uses full dimension."),
+}, async (args) => {
+  const store = await getCollection(args.collection);
+  const ivf = new IVFIndex(store, args.numClusters, args.numProbes);
+  const result = ivf.build(args.collection, args.sampleDims || store.dim);
+  return { content: [{ type: "text", text: JSON.stringify({ built: true, collection: args.collection, numClusters: result.numClusters, numVectors: result.numVectors }, null, 2) }] };
+});
+
+server.tool("vector_collection_search_ivf", "Search a vector collection using a pre-built IVF (K-means) index for approximate nearest neighbors. Faster than exact search for large collections. Must call vector_collection_build_ivf first.", {
+  collection: z.string().describe("Collection name."),
+  query: z.string().describe("Query text. Will be embedded via Ollama."),
+  limit: z.number().min(1).max(100).default(10).describe("Max results."),
+  metric: z.enum(["cosine", "euclidean", "dotProduct", "manhattan"]).default("cosine").describe("Distance metric."),
+}, async (args) => {
+  const store = await getCollection(args.collection);
+  const ivf = getIVF(args.collection);
+  ivf.store = store;
+  ivf._loadIndex(args.collection);
+  const qVec = await generateEmbedding(args.query);
+  const results = ivf.search(args.collection, qVec, args.limit, [128, 256, args.limit * 4], args.metric);
+  return { content: [{ type: "text", text: JSON.stringify({ collection: args.collection, query: args.query, results: results.map(r => ({ id: r.id, score: r.score, metadata: r.metadata })) }, null, 2) }] };
+});
+
+server.tool("vector_collection_cluster_info", "Get cluster statistics from an IVF index: centroid vectors, cluster sizes, and sample documents per cluster. Useful for understanding the semantic structure of your collection (e.g., topic discovery).", {
+  collection: z.string().describe("Collection name."),
+  maxSamplesPerCluster: z.number().min(1).max(20).default(3).describe("Max sample documents to show per cluster."),
+}, async (args) => {
+  const store = await getCollection(args.collection);
+  const ivf = getIVF(args.collection);
+  ivf.store = store;
+  const idx = ivf._loadIndex(args.collection);
+  if (!idx) throw new Error(`No IVF index found for ${args.collection}. Call vector_collection_build_ivf first.`);
+
+  const entry = store._load(args.collection);
+  const clusters = [];
+  for (let c = 0; c < idx.centroids.length; c++) {
+    const sampleIds = [];
+    for (let i = 0; i < idx.assignments.length && sampleIds.length < args.maxSamplesPerCluster; i++) {
+      if (idx.assignments[i] === c) sampleIds.push(entry.ids[i]);
+    }
+    const docs = sampleIds.map(id => {
+      const doc = entry.meta[entry.ids.indexOf(id)];
+      return { id, metadata: doc };
+    });
+    clusters.push({ clusterId: c, size: idx.assignments.filter(a => a === c).length, sampleIds, sampleDocuments: docs });
+  }
+
+  return { content: [{ type: "text", text: JSON.stringify({ collection: args.collection, numClusters: idx.centroids.length, clusters }, null, 2) }] };
+});
+
 server.tool("vector_usage_guide", "Get the complete usage guide for the Vector Store MCP. Call this when you need help with workflows, embedding models, or search strategies.", {
   topic: z.string().optional().describe("Optional topic: indexing, search, hybrid, models, deploy.")
 }, async (args) => {
@@ -303,6 +364,7 @@ server.connect(transport).then(() => {
   console.error("js-vector-store MCP Server started on stdio (encryption: " + (ENCRYPTION_KEY ? "enabled" : "disabled") + ")");
   console.error("Tools: vector_collection_create, vector_collection_list, vector_collection_info,");
   console.error("         vector_index_text, vector_index, vector_search,");
+  console.error("         vector_collection_build_ivf, vector_collection_search_ivf, vector_collection_cluster_info,");
   console.error("         vector_bm25_add, vector_bm25_search, vector_hybrid_search,");
   console.error("         vector_cross_search, vector_remove, vector_usage_guide");
 });
