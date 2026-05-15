@@ -4,6 +4,7 @@ const z = require("zod/v4");
 const path = require("path");
 
 const { VectorStore, QuantizedStore, BinaryQuantizedStore, BM25Index, HybridSearch, MemoryStorageAdapter, FileStorageAdapter } = require(path.join(__dirname, "js-vector-store.js"));
+const { EncryptedAdapter } = require(path.join(__dirname, "..", "js-doc-store", "js-doc-store.js"));
 
 const OLLAMA_HOST = process.env.OLLAMA_HOST || "http://localhost:11434";
 const OLLAMA_MODEL = process.env.OLLAMA_MODEL || "embeddinggemma:latest";
@@ -26,18 +27,44 @@ async function generateEmbedding(text) {
 }
 
 const collections = new Map();
+const adapters = new Map();
 const bm25s = new Map();
 const hybrids = new Map();
+const ENCRYPTION_KEY = process.env.ENCRYPTION_KEY || null;
 
-function getCollection(name, dim = 768, backend = "float32") {
-  if (collections.has(name)) return collections.get(name);
+async function getAdapter(name) {
+  if (adapters.has(name)) return adapters.get(name);
   const dir = path.join(DATA_DIR, name);
+  const inner = new FileStorageAdapter(dir);
+  if (ENCRYPTION_KEY) {
+    const adapter = await EncryptedAdapter.create(inner, ENCRYPTION_KEY);
+    adapters.set(name, adapter);
+    return adapter;
+  }
+  adapters.set(name, inner);
+  return inner;
+}
+
+async function getCollection(name, dim = 768, backend = "float32") {
+  if (collections.has(name)) return collections.get(name);
+  const adapter = await getAdapter(name);
+  if (typeof adapter.preloadAll === 'function') {
+    try { await adapter.preloadAll(); } catch (e) { /* first run or plain */ }
+  }
   let store;
-  if (backend === "binary") store = new BinaryQuantizedStore(new FileStorageAdapter(dir), dim);
-  else if (backend === "int8") store = new QuantizedStore(new FileStorageAdapter(dir), dim);
-  else store = new VectorStore(new FileStorageAdapter(dir), dim);
+  if (backend === "binary") store = new BinaryQuantizedStore(adapter, dim);
+  else if (backend === "int8") store = new QuantizedStore(adapter, dim);
+  else store = new VectorStore(adapter, dim);
   collections.set(name, store);
   return store;
+}
+
+async function persistStore(store) {
+  store.flush();
+  const adapter = store._adapter;
+  if (adapter && typeof adapter.persist === 'function') {
+    await adapter.persist();
+  }
 }
 
 function getBM25(name) {
@@ -45,9 +72,9 @@ function getBM25(name) {
   return bm25s.get(name);
 }
 
-function getHybrid(name) {
+async function getHybrid(name) {
   if (!hybrids.has(name)) {
-    const store = getCollection(name);
+    const store = await getCollection(name);
     const bm25 = getBM25(name);
     hybrids.set(name, new HybridSearch(store, bm25, "rrf"));
   }
@@ -59,9 +86,10 @@ server.tool("vector_collection_create", "Create a new vector collection. Choose 
   dimension: z.number().min(64).max(4096).default(768).describe("Embedding dimension. Must match your embedding model. embeddinggemma uses 768."),
   backend: z.enum(["float32", "int8", "binary"]).default("float32").describe("Storage backend: float32 = most accurate, int8 = ~4x compressed, binary = ~32x compressed."),
   metric: z.enum(["cosine", "euclidean", "dotProduct", "manhattan"]).default("cosine").describe("Distance metric for search."),
-  enableBM25: z.boolean().default(true).describe("If true, enables keyword search (BM25) alongside vector search for hybrid queries.")
+  enableBM25: z.boolean().default(true).describe("If true, enables keyword search (BM25) alongside vector search for hybrid queries."),
+  encrypted: z.boolean().optional().describe("If true, marks collection as encrypted (metadata depends on ENCRYPTION_KEY env var).")
 }, async (args) => {
-  const store = getCollection(args.name, args.dimension, args.backend);
+  const store = await getCollection(args.name, args.dimension, args.backend);
   if (args.enableBM25) getBM25(args.name);
   return { content: [{ type: "text", text: JSON.stringify({ created: args.name, dimension: args.dimension, backend: args.backend, metric: args.metric, bm25: args.enableBM25 }, null, 2) }] };
 });
@@ -78,7 +106,7 @@ server.tool("vector_collection_list", "List all vector collections with their st
 server.tool("vector_collection_info", "Get detailed information about a specific collection: vector count, sample vectors, available IDs, and BM25 vocabulary size.", {
   name: z.string().describe("Collection name.")
 }, async (args) => {
-  const store = getCollection(args.name);
+  const store = await getCollection(args.name);
   const ids = store.ids(args.name);
   const bm25 = bm25s.get(args.name);
   let sample = null;
@@ -95,11 +123,11 @@ server.tool("vector_index_text", "Index a text document by generating its embedd
   text: z.string().describe("Document text content. Will be embedded and indexed."),
   metadata: z.record(z.any()).optional().describe("Optional metadata: { title, author, tags, url, source }.")
 }, async (args) => {
-  const store = getCollection(args.collection);
+  const store = await getCollection(args.collection);
   const embedding = await generateEmbedding(args.text);
   const meta = { ...args.metadata, text: args.text };
   store.set(args.collection, args.id, embedding, meta);
-  store.flush();
+  await persistStore(store);
   const bm25 = bm25s.get(args.collection);
   if (bm25) bm25.addDocument(args.collection, args.id, args.text);
   return { content: [{ type: "text", text: JSON.stringify({ indexed: args.id, collection: args.collection, embeddingDim: embedding.length, textLength: args.text.length }, null, 2) }] };
@@ -111,9 +139,9 @@ server.tool("vector_index", "Index a pre-computed embedding vector directly. Use
   vector: z.array(z.number()).describe("Pre-computed embedding vector as array of floats."),
   metadata: z.record(z.any()).optional().describe("Optional metadata.")
 }, async (args) => {
-  const store = getCollection(args.collection, args.vector.length);
+  const store = await getCollection(args.collection, args.vector.length);
   store.set(args.collection, args.id, args.vector, args.metadata);
-  store.flush();
+  await persistStore(store);
   return { content: [{ type: "text", text: JSON.stringify({ indexed: args.id, collection: args.collection, dim: args.vector.length }, null, 2) }] };
 });
 
@@ -124,7 +152,7 @@ server.tool("vector_search", "Search a collection using semantic similarity. Ret
   limit: z.number().min(1).max(100).default(10).describe("Max results to return."),
   metric: z.enum(["cosine", "euclidean", "dotProduct", "manhattan"]).optional().describe("Override distance metric for this search.")
 }, async (args) => {
-  const store = getCollection(args.collection);
+  const store = await getCollection(args.collection);
   let qVec = args.queryVector;
   if (!qVec && args.query) qVec = await generateEmbedding(args.query);
   if (!qVec) throw new Error("Provide query text or queryVector.");
@@ -158,7 +186,7 @@ server.tool("vector_hybrid_search", "Combine semantic (vector) and keyword (BM25
   limit: z.number().min(1).max(100).default(10).describe("Max results."),
   strategy: z.enum(["rrf", "weighted"]).default("rrf").describe("Fusion strategy: rrf = Reciprocal Rank Fusion, weighted = weighted score sum.")
 }, async (args) => {
-  const store = getCollection(args.collection);
+  const store = await getCollection(args.collection);
   const bm25 = getBM25(args.collection);
   const qVec = await generateEmbedding(args.query);
   const hybrid = new HybridSearch(store, bm25, args.strategy);
@@ -176,7 +204,7 @@ server.tool("vector_cross_search", "Search across MULTIPLE collections simultane
   const qVec = await generateEmbedding(args.query);
   const allResults = [];
   for (const colName of args.collections) {
-    const store = getCollection(colName);
+    const store = await getCollection(colName);
     const bm25 = getBM25(colName);
     const hybrid = new HybridSearch(store, bm25, args.strategy);
     const results = hybrid.search(colName, qVec, args.query, args.limit);
@@ -193,9 +221,9 @@ server.tool("vector_remove", "Remove a document by ID from both the vector store
   collection: z.string().describe("Collection name."),
   id: z.string().describe("Document ID to remove.")
 }, async (args) => {
-  const store = getCollection(args.collection);
+  const store = await getCollection(args.collection);
   const removed = store.remove(args.collection, args.id);
-  store.flush();
+  await persistStore(store);
   const bm25 = bm25s.get(args.collection);
   if (bm25) bm25.removeDocument(args.collection, args.id);
   return { content: [{ type: "text", text: JSON.stringify({ removed: args.id, success: removed }, null, 2) }] };
@@ -256,7 +284,7 @@ server.tool("vector_usage_guide", "Get the complete usage guide for the Vector S
 
 const transport = new StdioServerTransport();
 server.connect(transport).then(() => {
-  console.error("js-vector-store MCP Server started on stdio");
+  console.error("js-vector-store MCP Server started on stdio (encryption: " + (ENCRYPTION_KEY ? "enabled" : "disabled") + ")");
   console.error("Tools: vector_collection_create, vector_collection_list, vector_collection_info,");
   console.error("         vector_index_text, vector_index, vector_search,");
   console.error("         vector_bm25_add, vector_bm25_search, vector_hybrid_search,");

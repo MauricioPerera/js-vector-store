@@ -58,6 +58,12 @@ Si hay multiples colecciones (docs, faqs, articles):
 - Dimension: 768
 - Override via OLLAMA_MODEL y OLLAMA_HOST env vars
 
+
+## Encriptacion
+
+- Activa encriptacion de metadata con la variable de entorno ENCRYPTION_KEY. Los archivos JSON (metadata de colecciones) se encriptan con AES-256-GCM via PBKDF2; los vectores binarios (.bin) permanecen sin encriptar por rendimiento.
+- ector_collection_create acepta encrypted: true para marcar la coleccion como sensible.
+
 ## Limitaciones
 
 - No genera embeddings por si mismo: requiere Ollama corriendo
