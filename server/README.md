@@ -32,7 +32,7 @@ npm run deploy
 
 ## API
 
-All endpoints require `Authorization: Bearer <token>` header (if API_TOKEN is set).
+All endpoints require `Authorization: Bearer <token>` header. If `API_TOKEN` is empty or not set, only `GET /` (service info) is allowed; all other requests return 401.
 
 Base URL: `https://js-vector-server.<your-subdomain>.workers.dev`
 
