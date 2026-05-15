@@ -4,7 +4,7 @@ const z = require("zod/v4");
 const path = require("path");
 
 const { VectorStore, QuantizedStore, BinaryQuantizedStore, BM25Index, HybridSearch, MemoryStorageAdapter, FileStorageAdapter, IVFIndex } = require(path.join(__dirname, "js-vector-store.js"));
-const { EncryptedAdapter, GitStorageAdapter } = require(path.join(__dirname, "..", "js-doc-store", "js-doc-store.js"));
+const { EncryptedAdapter, GitStorageAdapter, Auth } = require(path.join(__dirname, "..", "js-doc-store", "js-doc-store.js"));
 
 const OLLAMA_HOST = process.env.OLLAMA_HOST || "http://localhost:11434";
 const OLLAMA_MODEL = process.env.OLLAMA_MODEL || "embeddinggemma:latest";
@@ -32,6 +32,7 @@ const bm25s = new Map();
 const hybrids = new Map();
 const ivfIndexes = new Map();
 const ENCRYPTION_KEY = process.env.ENCRYPTION_KEY || null;
+const AUTH_SECRET = process.env.AUTH_SECRET || null;
 
 const GIT_STORAGE = process.env.GIT_STORAGE === "1" || process.env.GIT_STORAGE === "true";
 const GIT_COMMIT_MESSAGE = process.env.GIT_COMMIT_MESSAGE || null;
@@ -40,6 +41,54 @@ const GIT_PUSH_REMOTE = process.env.GIT_PUSH_REMOTE || "origin";
 const GIT_PUSH_BRANCH = process.env.GIT_PUSH_BRANCH || "master";
 const GIT_BATCH_INTERVAL = parseInt(process.env.GIT_BATCH_INTERVAL || "0", 10) * 1000;
 const GIT_IGNORE_BIN = process.env.GIT_IGNORE_BIN === "1" || process.env.GIT_IGNORE_BIN === "true";
+
+let _auth = null;
+let _auditCol = null;
+
+async function getAuth() {
+  if (_auth) return _auth;
+  if (!AUTH_SECRET) return null;
+  const adapter = await getAdapter("__auth__");
+  const db = new DocStore(adapter);
+  _auth = new Auth(db, { secret: AUTH_SECRET, usersCollection: "_users", sessionsCollection: "_sessions" });
+  await _auth.init();
+  return _auth;
+}
+
+function getAuditCol() {
+  if (_auditCol) return _auditCol;
+  const db = new DocStore(adapters.get("__audit__") || new FileStorageAdapter(path.join(DATA_DIR, "__audit__")));
+  const col = db.collection("_audit_logs");
+  _auditCol = col;
+  return col;
+}
+
+async function logAudit(toolName, args, token) {
+  try {
+    const col = getAuditCol();
+    const payload = token ? await (await getAuth()).verify(token) : null;
+    col.insert({
+      tool: toolName,
+      args: JSON.stringify(args),
+      userId: payload ? payload.sub : null,
+      email: payload ? payload.email : null,
+      roles: payload ? payload.roles : null,
+      timestamp: new Date().toISOString(),
+    });
+    const db = new DocStore(adapters.get("__audit__") || new FileStorageAdapter(path.join(DATA_DIR, "__audit__")));
+    db.flush();
+    const a = adapters.get("__audit__");
+    if (a && typeof a.persist === "function") await a.persist();
+  } catch {}
+}
+
+async function requireAuth(token, requiredRole) {
+  if (!AUTH_SECRET) return;
+  if (!token) throw new Error("Authentication required: call auth_login first and pass authToken");
+  const auth = await getAuth();
+  const payload = await auth.authorize(token, requiredRole);
+  if (!payload) throw new Error(`Unauthorized: role ${requiredRole || "any"} required`);
+}
 
 async function getAdapter(name) {
   if (adapters.has(name)) return adapters.get(name);
@@ -240,10 +289,12 @@ server.tool("vector_cross_search", "Search across MULTIPLE collections simultane
   return { content: [{ type: "text", text: JSON.stringify({ results: top.map(r => ({ id: r.id, score: r.score, collection: r.collection, metadata: r.metadata })) }, null, 2) }] };
 });
 
-server.tool("vector_remove", "Remove a document by ID from both the vector store and BM25 index.", {
+server.tool("vector_remove", "Remove a document by ID from both the vector store and BM25 index. Requires editor or admin role if AUTH_SECRET is configured.", {
   collection: z.string().describe("Collection name."),
-  id: z.string().describe("Document ID to remove.")
+  id: z.string().describe("Document ID to remove."),
+  authToken: z.string().optional().describe("JWT token. Required if AUTH_SECRET is set.")
 }, async (args) => {
+  await requireAuth(args.authToken, "editor");
   const store = await getCollection(args.collection);
   const removed = store.remove(args.collection, args.id);
   await persistStore(store);
@@ -304,6 +355,45 @@ server.tool("vector_collection_cluster_info", "Get cluster statistics from an IV
   }
 
   return { content: [{ type: "text", text: JSON.stringify({ collection: args.collection, numClusters: idx.centroids.length, clusters }, null, 2) }] };
+});
+
+server.tool("auth_register", "Register a new user account. Returns a JWT token.", {
+  email: z.string(),
+  password: z.string(),
+  role: z.string().optional(),
+}, async (args) => {
+  const auth = await getAuth();
+  if (!auth) throw new Error("AUTH_SECRET not configured");
+  const user = await auth.register(args.email, args.password, { roles: args.role ? [args.role] : undefined });
+  return { content: [{ type: "text", text: JSON.stringify({ registered: user.email, userId: user._id, roles: user.roles }, null, 2) }] };
+});
+
+server.tool("auth_login", "Authenticate and get a JWT token.", {
+  email: z.string(),
+  password: z.string(),
+}, async (args) => {
+  const auth = await getAuth();
+  if (!auth) throw new Error("AUTH_SECRET not configured");
+  const result = await auth.login(args.email, args.password);
+  return { content: [{ type: "text", text: JSON.stringify({ token: result.token, userId: result.user._id, roles: result.user.roles }, null, 2) }] };
+});
+
+server.tool("audit_query", "Query the audit log.", {
+  tool: z.string().optional(),
+  limit: z.number().min(1).max(1000).default(50),
+  sort: z.enum(["newest", "oldest"]).default("newest"),
+  authToken: z.string().optional(),
+}, async (args) => {
+  await requireAuth(args.authToken, null);
+  const col = getAuditCol();
+  const filter = {};
+  if (args.tool) filter.tool = args.tool;
+  let cursor = col.find(filter);
+  if (args.sort === "newest") cursor = cursor.sort({ timestamp: -1 });
+  else cursor = cursor.sort({ timestamp: 1 });
+  cursor = cursor.limit(args.limit);
+  const results = cursor.toArray();
+  return { content: [{ type: "text", text: JSON.stringify({ results, count: results.length }, null, 2) }] };
 });
 
 server.tool("vector_usage_guide", "Get the complete usage guide for the Vector Store MCP. Call this when you need help with workflows, embedding models, or search strategies.", {

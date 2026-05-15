@@ -91,6 +91,17 @@ Parametros clave:
 - `numProbes`: cuantos clusters explorar por query (default 10). Mas probes = mejor recall, mas lento.
 - `sampleDims`: dimensiones a muestrear para clustering (default: dimension completa).
 
+## Seguridad y Auditoria (Produccion)
+
+Configura AUTH_SECRET para activar autenticacion:
+- auth_register / auth_login: Gestion de usuarios.
+- audit_query: Consulta logs de auditoria.
+
+Herramientas protegidas:
+- vector_remove requiere rol editor.
+
+Operaciones de escritura se registran automaticamente. Consulta con audit_query.
+
 ## Limitaciones
 
 - No genera embeddings por si mismo: requiere Ollama corriendo
