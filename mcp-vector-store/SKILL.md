@@ -75,7 +75,8 @@ Si hay multiples colecciones (docs, faqs, articles):
 - Personaliza el mensaje con `GIT_COMMIT_MESSAGE`.
 - **Auto-push**: `GIT_AUTO_PUSH=1` empuja automaticamente al remote despues de cada commit. Configura `GIT_PUSH_REMOTE` (default: origin) y `GIT_PUSH_BRANCH` (default: master).
 - **Batch commits**: `GIT_BATCH_INTERVAL=300` acumula cambios y commitea cada 300 segundos. Default: 0 (inmediato).
-- Los vectores binarios (.bin) tambien se trackean si estan en el mismo directorio.
+- **Ignore binarios**: `GIT_IGNORE_BIN=1` ignora `*.bin` y `*.vec` en git. Recomendado para vector stores donde los archivos binarios son grandes.
+- Los vectores binarios (.bin) tambien se trackean si estan en el mismo directorio (a menos que actives `GIT_IGNORE_BIN=1`).
 
 ## Limitaciones
 
