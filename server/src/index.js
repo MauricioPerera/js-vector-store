@@ -93,16 +93,22 @@ export default {
       });
     }
 
+    const method = request.method;
+    const { parts } = parseRoute(request.url);
+
     // Auth
     const token = env.API_TOKEN;
-    if (token) {
+    const isRootGet = method === 'GET' && (parts.length === 0 || (parts.length === 1 && parts[0] === ''));
+    if (!token || token.trim() === '') {
+      if (!isRootGet) {
+        return err('Unauthorized: API_TOKEN not configured', 401);
+      }
+    } else {
       const auth = request.headers.get('Authorization');
       if (!auth || auth !== `Bearer ${token}`) {
         return err('Unauthorized', 401);
       }
     }
-
-    const method = request.method;
     const { parts } = parseRoute(request.url);
     const storeType = (env.STORE_TYPE || 'binary').toLowerCase();
     const dim = parseInt(env.DIMENSIONS || '768', 10);
