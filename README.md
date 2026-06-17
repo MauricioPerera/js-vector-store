@@ -387,13 +387,20 @@ Cross-encoder para re-ranking de candidatos via API externa:
 
 ```js
 const reranker = new Reranker({
-  apiUrl: 'https://api.cloudflare.com/...',
-  apiToken: 'Bearer ...',
+  apiUrl: 'https://api.cloudflare.com/client/v4/accounts/<account-id>/ai/run/@cf/baai/bge-reranker-base',
+  apiToken: '<api-token>',          // sin "Bearer ": el cliente antepone "Bearer " al enviar
   model: '@cf/baai/bge-reranker-base',
 });
 
-const reranked = await reranker.rerank(query, candidates, limit);
+// rank(query, documents) recibe los TEXTOS de los candidatos y devuelve
+// [{ index, score }] ordenado por score desc (index apunta al array de entrada).
+const ranked = await reranker.rank(query, candidates.map(c => c.text));
+const top = ranked.slice(0, limit).map(r => candidates[r.index]);
 ```
+
+> Métodos públicos adicionales no listados arriba: `Reranker.crossModelSearch()`,
+> `BM25Index.exportState()` / `importState()`, y `VectorStore.listCollections()` (descubre
+> colecciones desde el adapter; distinto de `collections()`, que lista lo cargado en memoria).
 
 ## Benchmark
 
