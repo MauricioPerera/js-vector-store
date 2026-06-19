@@ -471,27 +471,32 @@ class VectorStore {
     return buf;
   }
 
+  // Sobrescribe in situ el vector ya commiteado en `existing` (solo si hay buffer binario).
+  _writeCommittedVector(entry, existing, vector) {
+    if (!entry.bin) return;
+    const f32 = new Float32Array(entry.bin, existing * this._stride, this.dim);
+    for (let d = 0; d < this.dim; d++) f32[d] = vector[d] ?? 0;
+  }
+
   set(col, id, vector, metadata = {}) {
     const entry    = this._load(col);
     const existing = entry.idMap.get(id);
-    if (existing !== undefined) {
-      const committed = entry.ids.length - entry.pending.length;
-      if (existing < committed) {
-        if (entry.bin) {
-          const f32 = new Float32Array(entry.bin, existing * this._stride, this.dim);
-          for (let d = 0; d < this.dim; d++) f32[d] = vector[d] ?? 0;
-        }
-      } else {
-        entry.pending[existing - committed].vector = vector;
-      }
-      entry.meta[existing] = metadata;
-    } else {
+    if (existing === undefined) {
       const idx = entry.ids.length;
       entry.ids.push(id);
       entry.meta.push(metadata);
       entry.idMap.set(id, idx);
       entry.pending.push({ id, vector, metadata });
+      entry.dirty = true;
+      return;
     }
+    const committed = entry.ids.length - entry.pending.length;
+    if (existing < committed) {
+      this._writeCommittedVector(entry, existing, vector);
+    } else {
+      entry.pending[existing - committed].vector = vector;
+    }
+    entry.meta[existing] = metadata;
     entry.dirty = true;
   }
 
@@ -1573,6 +1578,16 @@ class IVFIndex {
 
   _indexFile(col) { return `${col}.ivf.json`; }
 
+  // Distancia² mínima del punto `i` a los `c` centroides ya elegidos (k-means++).
+  _nearestCentroidDistSq(flat, i, centroids, c, dim) {
+    let minD = Infinity;
+    for (let cc = 0; cc < c; cc++) {
+      const distSq = euclideanDistSq(flat, i * dim, centroids, cc * dim, dim);
+      if (distSq < minD) minD = distSq;
+    }
+    return minD;
+  }
+
   _kmeansInit(flat, n, dim, k) {
     const centroids = new Float64Array(k * dim);
     const first = Math.floor(Math.random() * n);
@@ -1581,11 +1596,7 @@ class IVFIndex {
     for (let c = 1; c < k; c++) {
       let total = 0;
       for (let i = 0; i < n; i++) {
-        let minD = Infinity;
-        for (let cc = 0; cc < c; cc++) {
-          const distSq = euclideanDistSq(flat, i * dim, centroids, cc * dim, dim);
-          if (distSq < minD) minD = distSq;
-        }
+        const minD = this._nearestCentroidDistSq(flat, i, centroids, c, dim);
         dists[i] = minD;
         total += minD;
       }
@@ -1807,13 +1818,8 @@ class CloudflareKVAdapter {
     do {
       const list = await this.kv.list({ prefix: this.prefix, cursor });
       for (const k of list.keys) {
-        if (this.prefix) {
-          if (k.name.startsWith(this.prefix)) {
-            result.push(k.name.slice(this.prefix.length));
-          }
-        } else {
-          result.push(k.name);
-        }
+        if (this.prefix && !k.name.startsWith(this.prefix)) continue;
+        result.push(this.prefix ? k.name.slice(this.prefix.length) : k.name);
       }
       cursor = list.list_complete ? undefined : list.cursor;
     } while (cursor);
