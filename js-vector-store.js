@@ -193,7 +193,11 @@ const FILTER_COMPARATORS = {
   $in:     (val, t) => Array.isArray(t) && t.includes(val),
   $nin:    (val, t) => !(Array.isArray(t) && t.includes(val)),
   $exists: (val, t) => (val !== undefined) === t,
-  $regex:  (val, t) => (typeof t === 'string' ? new RegExp(t) : t).test(String(val ?? '')),
+  $regex:  (val, t) => {
+    const re = typeof t === 'string' ? new RegExp(t) : t;
+    if (re.global || re.sticky) re.lastIndex = 0;
+    return re.test(String(val ?? ''));
+  },
 };
 
 // Operadores lógicos: tabla de despacho. Devuelven true si el metadata CUMPLE el operador.
