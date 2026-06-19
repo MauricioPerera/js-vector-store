@@ -15,6 +15,8 @@ const {
   normalize,
 } = require('../../js-vector-store.js');
 
+const { resolveRoute } = require('./routes.js');
+
 // ─── Helpers ───────────────────────────────────────────────────────────────
 
 function json(data, status = 200) {
@@ -77,251 +79,259 @@ async function listCollections(kv, prefix, type) {
   return collections;
 }
 
+// ─── CORS / Auth ───────────────────────────────────────────────────────────
+
+const CORS_HEADERS = {
+  'Access-Control-Allow-Origin': '*',
+  'Access-Control-Allow-Methods': 'GET, POST, PUT, DELETE, OPTIONS',
+  'Access-Control-Allow-Headers': 'Content-Type, Authorization',
+  'Access-Control-Max-Age': '86400',
+};
+
+// Devuelve una Response de error de auth, o null si la petición está autorizada.
+function checkAuth(request, env, method, parts) {
+  const token = env.API_TOKEN;
+  const isRootGet = method === 'GET' && (parts.length === 0 || (parts.length === 1 && parts[0] === ''));
+  if (!token || token.trim() === '') {
+    return isRootGet ? null : err('Unauthorized: API_TOKEN not configured', 401);
+  }
+  const auth = request.headers.get('Authorization');
+  return (!auth || auth !== `Bearer ${token}`) ? err('Unauthorized', 401) : null;
+}
+
+// ─── Handlers de nivel superior ──────────────────────────────────────────────
+// Firma uniforme: (request, env, ctx) -> Response. ctx = { storeType, dim, prefix }.
+
+function hRoot(request, env, ctx) {
+  return ok({ service: 'js-vector-server', version: '1.0.0', storeType: ctx.storeType, dimensions: ctx.dim });
+}
+
+async function hStats(request, env, ctx) {
+  const collections = await listCollections(env.VECTOR_KV, ctx.prefix, ctx.storeType);
+  const ext = fileExtensions(ctx.storeType);
+  const stats = {};
+  for (const col of collections) {
+    const manifest = await env.VECTOR_KV.get(ctx.prefix + col + ext.json, 'json');
+    stats[col] = { count: manifest?.ids?.length || 0, dim: ctx.dim };
+  }
+  return ok({ storeType: ctx.storeType, dimensions: ctx.dim, collections: stats });
+}
+
+async function hListCollections(request, env, ctx) {
+  const collections = await listCollections(env.VECTOR_KV, ctx.prefix, ctx.storeType);
+  return ok({ collections });
+}
+
+async function hSearchAcross(request, env, ctx) {
+  const body = await readBody(request);
+  if (!body || !body.vector || !body.collections) {
+    return err('Required: vector, collections', 400);
+  }
+  const adapter = new CloudflareKVAdapter(env.VECTOR_KV, ctx.prefix);
+  const ext = fileExtensions(ctx.storeType);
+  const files = [];
+  for (const col of body.collections) {
+    files.push(col + ext.bin, col + ext.json);
+  }
+  await adapter.preload(files);
+  const store = createStore(adapter, ctx.storeType, ctx.dim);
+  const results = store.searchAcross(
+    body.collections, body.vector, body.limit || 5, body.metric || 'cosine'
+  );
+  return ok({ results });
+}
+
+async function hRerank(request, env, ctx) {
+  const body = await readBody(request);
+  if (!body || !body.query || !body.documents) {
+    return err('Required: query (string), documents (string[])', 400);
+  }
+  const cfAccount = env.CF_ACCOUNT_ID;
+  const cfToken   = env.CF_API_TOKEN;
+  if (!cfAccount || !cfToken) {
+    return err('Reranker requires CF_ACCOUNT_ID and CF_API_TOKEN env vars', 500);
+  }
+  const reranker = Reranker.cloudflare(cfAccount, cfToken, body.model);
+  const ranked = await reranker.rank(body.query, body.documents);
+  return ok({ ranked });
+}
+
+async function hCrossModelSearch(request, env, ctx) {
+  const body = await readBody(request);
+  if (!body || !body.queryText || !body.sources) {
+    return err('Required: queryText (string), sources ([{collection, queryVector}])', 400);
+  }
+  const cfAccount = env.CF_ACCOUNT_ID;
+  const cfToken   = env.CF_API_TOKEN;
+  if (!cfAccount || !cfToken) {
+    return err('Reranker requires CF_ACCOUNT_ID and CF_API_TOKEN env vars', 500);
+  }
+  const reranker = Reranker.cloudflare(cfAccount, cfToken, body.model);
+  const adapter = new CloudflareKVAdapter(env.VECTOR_KV, ctx.prefix);
+  const ext = fileExtensions(ctx.storeType);
+  const files = [];
+  for (const s of body.sources) {
+    files.push(s.collection + ext.bin, s.collection + ext.json);
+  }
+  await adapter.preload(files);
+  const store = createStore(adapter, ctx.storeType, ctx.dim);
+
+  const sources = body.sources.map(s => ({
+    store,
+    collection: s.collection,
+    queryVector: s.queryVector,
+  }));
+
+  const results = await reranker.crossModelSearch(body.queryText, sources, {
+    candidatesPerSource: body.candidatesPerSource || 10,
+    limit: body.limit || 5,
+    textField: body.textField || 'text',
+  });
+
+  return ok({ results });
+}
+
+const TOP_LEVEL = {
+  root: hRoot,
+  stats: hStats,
+  listCollections: hListCollections,
+  searchAcross: hSearchAcross,
+  rerank: hRerank,
+  crossModelSearch: hCrossModelSearch,
+};
+
+// ─── Handlers de colección ───────────────────────────────────────────────────
+// Firma uniforme: (c) -> Response, donde c = { store, adapter, col, request, parts }.
+// Marcan c.mutated = true cuando cambian datos; el dispatcher persiste en el finally.
+
+async function hDropCollection(c) {
+  const ext = fileExtensions(c.storeType);
+  c.store.drop(c.col);
+  c.store.flush();
+  await c.adapter.deleteFromKV(c.col + ext.bin);
+  await c.adapter.deleteFromKV(c.col + ext.json);
+  return ok({ dropped: c.col });
+}
+
+function hCount(c) {
+  return ok({ collection: c.col, count: c.store.count(c.col) });
+}
+
+function hIds(c) {
+  return ok({ collection: c.col, ids: c.store.ids(c.col) });
+}
+
+async function hSearch(c) {
+  const body = await readBody(c.request);
+  if (!body || !body.vector) return err('Required: vector', 400);
+  const results = c.store.search(
+    c.col, body.vector, body.limit || 5, body.dimSlice || 0,
+    body.metric || 'cosine', body.filter || null
+  );
+  return ok({ collection: c.col, results });
+}
+
+async function hMatryoshka(c) {
+  const body = await readBody(c.request);
+  if (!body || !body.vector) return err('Required: vector', 400);
+  const results = c.store.matryoshkaSearch(
+    c.col, body.vector, body.limit || 5,
+    body.stages || [128, 384, 768], body.metric || 'cosine'
+  );
+  return ok({ collection: c.col, results });
+}
+
+async function hSetVector(c) {
+  const body = await readBody(c.request);
+  if (!body || !body.id || !body.vector) return err('Required: id, vector', 400);
+  c.store.set(c.col, body.id, body.vector, body.metadata || {});
+  c.mutated = true;
+  return ok({ collection: c.col, id: body.id, action: 'set' });
+}
+
+async function hBatchVectors(c) {
+  const body = await readBody(c.request);
+  if (!body || !Array.isArray(body.vectors)) return err('Required: vectors[]', 400);
+  let count = 0;
+  for (const v of body.vectors) {
+    if (v.id && v.vector) {
+      c.store.set(c.col, v.id, v.vector, v.metadata || {});
+      count++;
+    }
+  }
+  c.mutated = true;
+  return ok({ collection: c.col, imported: count });
+}
+
+function hGetVector(c) {
+  const id = decodeURIComponent(c.parts[4]);
+  const item = c.store.get(c.col, id);
+  if (!item) return err('Vector not found', 404);
+  return ok(item);
+}
+
+async function hDeleteVector(c) {
+  const id = decodeURIComponent(c.parts[4]);
+  const removed = c.store.remove(c.col, id);
+  if (!removed) return err('Vector not found', 404);
+  c.mutated = true;
+  return ok({ collection: c.col, id, action: 'removed' });
+}
+
+const COLLECTION = {
+  dropCollection: hDropCollection,
+  count: hCount,
+  ids: hIds,
+  search: hSearch,
+  matryoshka: hMatryoshka,
+  setVector: hSetVector,
+  batchVectors: hBatchVectors,
+  getVector: hGetVector,
+  deleteVector: hDeleteVector,
+};
+
+// Setup del store de la colección + dispatch + persistencia de mutaciones (finally).
+async function runCollectionRoute(route, request, env, ctx, parts) {
+  const col = parts[2];
+  const ext = fileExtensions(ctx.storeType);
+  const adapter = new CloudflareKVAdapter(env.VECTOR_KV, ctx.prefix);
+  await adapter.preload([col + ext.bin, col + ext.json]);
+  const store = createStore(adapter, ctx.storeType, ctx.dim);
+  const c = { store, adapter, col, request, parts, storeType: ctx.storeType, mutated: false };
+  try {
+    return await COLLECTION[route](c);
+  } finally {
+    if (c.mutated) {
+      store.flush();
+      await adapter.persist();
+    }
+  }
+}
+
 // ─── Main handler ──────────────────────────────────────────────────────────
+// fetch() delgado: CORS -> auth -> resolveRoute (tabla pura) -> handler. El enrutado vive en
+// routes.js (testeado); aquí solo se despacha y se hace el I/O contra KV.
 
 export default {
   async fetch(request, env) {
-    // CORS preflight
     if (request.method === 'OPTIONS') {
-      return new Response(null, {
-        headers: {
-          'Access-Control-Allow-Origin': '*',
-          'Access-Control-Allow-Methods': 'GET, POST, PUT, DELETE, OPTIONS',
-          'Access-Control-Allow-Headers': 'Content-Type, Authorization',
-          'Access-Control-Max-Age': '86400',
-        },
-      });
+      return new Response(null, { headers: CORS_HEADERS });
     }
-
     const method = request.method;
     const { parts } = parseRoute(request.url);
 
-    // Auth
-    const token = env.API_TOKEN;
-    const isRootGet = method === 'GET' && (parts.length === 0 || (parts.length === 1 && parts[0] === ''));
-    if (!token || token.trim() === '') {
-      if (!isRootGet) {
-        return err('Unauthorized: API_TOKEN not configured', 401);
-      }
-    } else {
-      const auth = request.headers.get('Authorization');
-      if (!auth || auth !== `Bearer ${token}`) {
-        return err('Unauthorized', 401);
-      }
-    }
-    const storeType = (env.STORE_TYPE || 'binary').toLowerCase();
-    const dim = parseInt(env.DIMENSIONS || '768', 10);
-    const prefix = '';
+    const authError = checkAuth(request, env, method, parts);
+    if (authError) return authError;
 
-    // ── Route: GET / ─────────────────────────────────────────
-    if (parts.length === 0 || (parts.length === 1 && parts[0] === '')) {
-      return ok({
-        service: 'js-vector-server',
-        version: '1.0.0',
-        storeType,
-        dimensions: dim,
-      });
-    }
+    const ctx = {
+      storeType: (env.STORE_TYPE || 'binary').toLowerCase(),
+      dim: parseInt(env.DIMENSIONS || '768', 10),
+      prefix: '',
+    };
 
-    // All routes under /v1/...
-    if (parts[0] !== 'v1') return err('Not found', 404);
-
-    // ── Route: GET /v1/stats ─────────────────────────────────
-    if (parts[1] === 'stats' && method === 'GET') {
-      const collections = await listCollections(env.VECTOR_KV, prefix, storeType);
-      const ext = fileExtensions(storeType);
-      const stats = {};
-      for (const col of collections) {
-        const manifest = await env.VECTOR_KV.get(prefix + col + ext.json, 'json');
-        stats[col] = { count: manifest?.ids?.length || 0, dim };
-      }
-      return ok({ storeType, dimensions: dim, collections: stats });
-    }
-
-    // ── Route: GET /v1/collections ───────────────────────────
-    if (parts[1] === 'collections' && parts.length === 2 && method === 'GET') {
-      const collections = await listCollections(env.VECTOR_KV, prefix, storeType);
-      return ok({ collections });
-    }
-
-    // ── Route: POST /v1/search-across ────────────────────────
-    if (parts[1] === 'search-across' && method === 'POST') {
-      const body = await readBody(request);
-      if (!body || !body.vector || !body.collections) {
-        return err('Required: vector, collections', 400);
-      }
-      const adapter = new CloudflareKVAdapter(env.VECTOR_KV, prefix);
-      const ext = fileExtensions(storeType);
-      const files = [];
-      for (const col of body.collections) {
-        files.push(col + ext.bin, col + ext.json);
-      }
-      await adapter.preload(files);
-      const store = createStore(adapter, storeType, dim);
-      const results = store.searchAcross(
-        body.collections, body.vector, body.limit || 5, body.metric || 'cosine'
-      );
-      return ok({ results });
-    }
-
-    // ── Route: POST /v1/rerank ──────────────────────────────
-    // Cross-encoder reranking: toma query_text + candidatos con texto,
-    // reranquea via Workers AI bge-reranker-base
-    if (parts[1] === 'rerank' && method === 'POST') {
-      const body = await readBody(request);
-      if (!body || !body.query || !body.documents) {
-        return err('Required: query (string), documents (string[])', 400);
-      }
-      const cfAccount = env.CF_ACCOUNT_ID;
-      const cfToken   = env.CF_API_TOKEN;
-      if (!cfAccount || !cfToken) {
-        return err('Reranker requires CF_ACCOUNT_ID and CF_API_TOKEN env vars', 500);
-      }
-      const reranker = Reranker.cloudflare(cfAccount, cfToken, body.model);
-      const ranked = await reranker.rank(body.query, body.documents);
-      return ok({ ranked });
-    }
-
-    // ── Route: POST /v1/cross-model-search ───────────────────
-    // Busca en múltiples colecciones (pueden ser de distintos modelos),
-    // reranquea los resultados con cross-encoder
-    if (parts[1] === 'cross-model-search' && method === 'POST') {
-      const body = await readBody(request);
-      if (!body || !body.queryText || !body.sources) {
-        return err('Required: queryText (string), sources ([{collection, queryVector}])', 400);
-      }
-      const cfAccount = env.CF_ACCOUNT_ID;
-      const cfToken   = env.CF_API_TOKEN;
-      if (!cfAccount || !cfToken) {
-        return err('Reranker requires CF_ACCOUNT_ID and CF_API_TOKEN env vars', 500);
-      }
-      const reranker = Reranker.cloudflare(cfAccount, cfToken, body.model);
-      const adapter = new CloudflareKVAdapter(env.VECTOR_KV, prefix);
-      const ext = fileExtensions(storeType);
-      const files = [];
-      for (const s of body.sources) {
-        files.push(s.collection + ext.bin, s.collection + ext.json);
-      }
-      await adapter.preload(files);
-      const store = createStore(adapter, storeType, dim);
-
-      const sources = body.sources.map(s => ({
-        store,
-        collection: s.collection,
-        queryVector: s.queryVector,
-      }));
-
-      const results = await reranker.crossModelSearch(body.queryText, sources, {
-        candidatesPerSource: body.candidatesPerSource || 10,
-        limit: body.limit || 5,
-        textField: body.textField || 'text',
-      });
-
-      return ok({ results });
-    }
-
-    // ── Collection routes: /v1/collections/:col/... ──────────
-    if (parts[1] !== 'collections' || !parts[2]) return err('Not found', 404);
-
-    const col = parts[2];
-    const ext = fileExtensions(storeType);
-    const adapter = new CloudflareKVAdapter(env.VECTOR_KV, prefix);
-    await adapter.preload([col + ext.bin, col + ext.json]);
-    const store = createStore(adapter, storeType, dim);
-
-    let mutated = false;
-
-    try {
-      // ── DELETE /v1/collections/:col ──────────────────────
-      if (parts.length === 3 && method === 'DELETE') {
-        store.drop(col);
-        store.flush();
-        await adapter.deleteFromKV(col + ext.bin);
-        await adapter.deleteFromKV(col + ext.json);
-        return ok({ dropped: col });
-      }
-
-      // ── GET /v1/collections/:col/count ──────────────────
-      if (parts[3] === 'count' && method === 'GET') {
-        return ok({ collection: col, count: store.count(col) });
-      }
-
-      // ── GET /v1/collections/:col/ids ────────────────────
-      if (parts[3] === 'ids' && method === 'GET') {
-        return ok({ collection: col, ids: store.ids(col) });
-      }
-
-      // ── POST /v1/collections/:col/search ────────────────
-      if (parts[3] === 'search' && method === 'POST') {
-        const body = await readBody(request);
-        if (!body || !body.vector) return err('Required: vector', 400);
-        const results = store.search(
-          col, body.vector, body.limit || 5, body.dimSlice || 0,
-          body.metric || 'cosine', body.filter || null
-        );
-        return ok({ collection: col, results });
-      }
-
-      // ── POST /v1/collections/:col/matryoshka ────────────
-      if (parts[3] === 'matryoshka' && method === 'POST') {
-        const body = await readBody(request);
-        if (!body || !body.vector) return err('Required: vector', 400);
-        const results = store.matryoshkaSearch(
-          col, body.vector, body.limit || 5,
-          body.stages || [128, 384, 768], body.metric || 'cosine'
-        );
-        return ok({ collection: col, results });
-      }
-
-      // ── POST /v1/collections/:col/vectors ───────────────
-      if (parts[3] === 'vectors' && !parts[4] && method === 'POST') {
-        const body = await readBody(request);
-        if (!body || !body.id || !body.vector) return err('Required: id, vector', 400);
-        store.set(col, body.id, body.vector, body.metadata || {});
-        mutated = true;
-        return ok({ collection: col, id: body.id, action: 'set' });
-      }
-
-      // ── POST /v1/collections/:col/vectors/batch ─────────
-      if (parts[3] === 'vectors' && parts[4] === 'batch' && method === 'POST') {
-        const body = await readBody(request);
-        if (!body || !Array.isArray(body.vectors)) return err('Required: vectors[]', 400);
-        let count = 0;
-        for (const v of body.vectors) {
-          if (v.id && v.vector) {
-            store.set(col, v.id, v.vector, v.metadata || {});
-            count++;
-          }
-        }
-        mutated = true;
-        return ok({ collection: col, imported: count });
-      }
-
-      // ── GET /v1/collections/:col/vectors/:id ────────────
-      if (parts[3] === 'vectors' && parts[4] && method === 'GET') {
-        const id = decodeURIComponent(parts[4]);
-        const item = store.get(col, id);
-        if (!item) return err('Vector not found', 404);
-        return ok(item);
-      }
-
-      // ── DELETE /v1/collections/:col/vectors/:id ─────────
-      if (parts[3] === 'vectors' && parts[4] && method === 'DELETE') {
-        const id = decodeURIComponent(parts[4]);
-        const removed = store.remove(col, id);
-        if (!removed) return err('Vector not found', 404);
-        mutated = true;
-        return ok({ collection: col, id, action: 'removed' });
-      }
-
-      return err('Not found', 404);
-
-    } finally {
-      // Persist mutations to KV
-      if (mutated) {
-        store.flush();
-        await adapter.persist();
-      }
-    }
+    const route = resolveRoute(method, parts);
+    if (route === null) return err('Not found', 404);
+    if (TOP_LEVEL[route]) return TOP_LEVEL[route](request, env, ctx);
+    return runCollectionRoute(route, request, env, ctx, parts);
   },
 };
