@@ -181,63 +181,48 @@ function computeScore(a, b, dims, metric) {
 //   { $or: [{ category: 'tech' }, { category: 'science' }] }
 //   { name: { $regex: '^AI' } }                   → regex match
 
+// Comparadores de campo: tabla de despacho (cada operador es una unidad pequeña y testeable).
+// Devuelven true si el valor CUMPLE el operador. Semántica idéntica al switch original.
+const FILTER_COMPARATORS = {
+  $eq:     (val, t) => val === t,
+  $ne:     (val, t) => val !== t,
+  $gt:     (val, t) => val > t,
+  $gte:    (val, t) => val >= t,
+  $lt:     (val, t) => val < t,
+  $lte:    (val, t) => val <= t,
+  $in:     (val, t) => Array.isArray(t) && t.includes(val),
+  $nin:    (val, t) => !(Array.isArray(t) && t.includes(val)),
+  $exists: (val, t) => (val !== undefined) === t,
+  $regex:  (val, t) => (typeof t === 'string' ? new RegExp(t) : t).test(String(val ?? '')),
+};
+
+// Operadores lógicos: tabla de despacho. Devuelven true si el metadata CUMPLE el operador.
+const FILTER_LOGICAL = {
+  $and: (metadata, subs) => Array.isArray(subs) && subs.every((s) => matchFilter(metadata, s)),
+  $or:  (metadata, subs) => Array.isArray(subs) && subs.some((s) => matchFilter(metadata, s)),
+  $not: (metadata, sub) => !matchFilter(metadata, sub),
+};
+
+// Una condición de campo: igualdad simple, o un objeto-operador (todos sus operadores deben cumplir).
+function matchFieldCondition(val, cond) {
+  if (cond === null || typeof cond !== 'object') return val === cond;
+  for (const op of Object.keys(cond)) {
+    const cmp = FILTER_COMPARATORS[op];
+    if (cmp && !cmp(val, cond[op])) return false; // operador desconocido: se ignora (como el default)
+  }
+  return true;
+}
+
 function matchFilter(metadata, filter) {
   if (!filter || typeof filter !== 'object') return true;
   if (!metadata) metadata = {};
-
   for (const key of Object.keys(filter)) {
-    // Logical operators
-    if (key === '$and') {
-      if (!Array.isArray(filter.$and)) return false;
-      for (const sub of filter.$and) {
-        if (!matchFilter(metadata, sub)) return false;
-      }
+    const logical = FILTER_LOGICAL[key];
+    if (logical) {
+      if (!logical(metadata, filter[key])) return false;
       continue;
     }
-    if (key === '$or') {
-      if (!Array.isArray(filter.$or)) return false;
-      let any = false;
-      for (const sub of filter.$or) {
-        if (matchFilter(metadata, sub)) { any = true; break; }
-      }
-      if (!any) return false;
-      continue;
-    }
-    if (key === '$not') {
-      if (matchFilter(metadata, filter.$not)) return false;
-      continue;
-    }
-
-    const val   = metadata[key];
-    const cond  = filter[key];
-
-    // Simple equality
-    if (cond === null || typeof cond !== 'object') {
-      if (val !== cond) return false;
-      continue;
-    }
-
-    // Operator object
-    for (const op of Object.keys(cond)) {
-      const target = cond[op];
-      switch (op) {
-        case '$eq':     if (val !== target) return false; break;
-        case '$ne':     if (val === target) return false; break;
-        case '$gt':     if (!(val > target)) return false; break;
-        case '$gte':    if (!(val >= target)) return false; break;
-        case '$lt':     if (!(val < target)) return false; break;
-        case '$lte':    if (!(val <= target)) return false; break;
-        case '$in':     if (!Array.isArray(target) || !target.includes(val)) return false; break;
-        case '$nin':    if (Array.isArray(target) && target.includes(val)) return false; break;
-        case '$exists': if ((val !== undefined) !== target) return false; break;
-        case '$regex': {
-          const re = typeof target === 'string' ? new RegExp(target) : target;
-          if (!re.test(String(val ?? ''))) return false;
-          break;
-        }
-        default: break;
-      }
-    }
+    if (!matchFieldCondition(metadata[key], filter[key])) return false;
   }
   return true;
 }
