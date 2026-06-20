@@ -2067,6 +2067,22 @@ class BM25Index {
 //   'rrf'      → Reciprocal Rank Fusion: score = sum(1/(k+rank)) por cada sistema
 //   'weighted' → Min-max normalize + weighted sum
 
+// Rango [min, max] (y su amplitud) de una secuencia de scores. Vacía -> Infinity/-Infinity
+// (igual que el original, para que normalizeScore devuelva 1.0 cuando range <= 0).
+function scoreRange(scores) {
+  let min = Infinity, max = -Infinity;
+  for (const s of scores) {
+    if (s < min) min = s;
+    if (s > max) max = s;
+  }
+  return { min, max, range: max - min };
+}
+
+// Normaliza `value` a [0,1] dentro de [min, min+range]; si range <= 0, 1.0 (igual que el original).
+function normalizeScore(value, min, range) {
+  return range > 0 ? (value - min) / range : 1.0;
+}
+
 class HybridSearch {
   /**
    * @param {VectorStore|QuantizedStore|BinaryQuantizedStore} store
@@ -2153,29 +2169,14 @@ class HybridSearch {
    * Weighted fusion con min-max normalization.
    */
   _fuseWeighted(vecResults, bm25Scores, limit, vectorWeight, textWeight) {
-    // Normalizar vector scores a [0,1]
-    let vecMin = Infinity, vecMax = -Infinity;
-    for (const r of vecResults) {
-      if (r.score < vecMin) vecMin = r.score;
-      if (r.score > vecMax) vecMax = r.score;
-    }
-    const vecRange = vecMax - vecMin;
-
-    // Normalizar BM25 scores a [0,1]
-    let bm25Min = Infinity, bm25Max = -Infinity;
-    for (const [, s] of bm25Scores) {
-      if (s < bm25Min) bm25Min = s;
-      if (s > bm25Max) bm25Max = s;
-    }
-    const bm25Range = bm25Max - bm25Min;
-
-    // Fusionar
+    const vec = scoreRange(vecResults.map(r => r.score));
+    const bm25 = scoreRange(Array.from(bm25Scores.values()));
     const fused = new Map();
 
     for (const r of vecResults) {
-      const normVec = vecRange > 0 ? (r.score - vecMin) / vecRange : 1.0;
+      const normVec = normalizeScore(r.score, vec.min, vec.range);
       const normBm25 = bm25Scores.has(r.id)
-        ? (bm25Range > 0 ? (bm25Scores.get(r.id) - bm25Min) / bm25Range : 1.0)
+        ? normalizeScore(bm25Scores.get(r.id), bm25.min, bm25.range)
         : 0;
       fused.set(r.id, {
         score: vectorWeight * normVec + textWeight * normBm25,
@@ -2185,10 +2186,9 @@ class HybridSearch {
 
     // Docs que estan en BM25 pero no en vector results
     for (const [id, bm25Score] of bm25Scores) {
-      if (!fused.has(id)) {
-        const normBm25 = bm25Range > 0 ? (bm25Score - bm25Min) / bm25Range : 1.0;
-        fused.set(id, { score: textWeight * normBm25, metadata: {} });
-      }
+      if (fused.has(id)) continue;
+      const normBm25 = normalizeScore(bm25Score, bm25.min, bm25.range);
+      fused.set(id, { score: textWeight * normBm25, metadata: {} });
     }
 
     const heap = new TopKHeap(limit);
