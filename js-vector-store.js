@@ -323,6 +323,10 @@ class FileStorageAdapter {
     const file = this.path.join(this.dir, filename);
     if (this.fs.existsSync(file)) this.fs.unlinkSync(file);
   }
+
+  listKeys() {
+    return this.fs.readdirSync(this.dir);
+  }
 }
 
 class MemoryStorageAdapter {
@@ -534,6 +538,9 @@ class VectorStore {
 
   _load(col) {
     if (this._collections.has(col)) return this._collections.get(col);
+    if (this.maxCollections > 0 && this._collections.size >= this.maxCollections) {
+      throw new Error(`VectorStore: maxCollections limit (${this.maxCollections}) reached — drop a collection before adding "${col}"`);
+    }
     const manifest = this._adapter.readJson(this._jsonFile(col));
     const ids  = manifest ? manifest.ids  : [];
     const meta = manifest ? manifest.meta : [];
@@ -626,7 +633,6 @@ class VectorStore {
     entry.idMap.clear();
     for (let i = 0; i < entry.ids.length; i++) entry.idMap.set(entry.ids[i], i);
     entry.bin = newBuf;
-    this._adapter.writeBin(this._binFile(col), newBuf);
     entry.dirty = true;
     return true;
   }
@@ -865,7 +871,6 @@ class QuantizedStore {
     entry.idMap.clear();
     for (let i = 0; i < entry.ids.length; i++) entry.idMap.set(entry.ids[i], i);
     entry.bin = newBuf;
-    this._adapter.writeBin(this._binFile(col), newBuf);
     entry.dirty = true;
     return true;
   }
@@ -1129,7 +1134,6 @@ class BinaryQuantizedStore {
 
     // Truncate buffer
     entry.bin = entry.bin.slice(0, entry.ids.length * bpv);
-    this._adapter.writeBin(this._binFile(col), entry.bin);
     entry.dirty = true;
     return true;
   }
@@ -1505,7 +1509,6 @@ class PolarQuantizedStore {
     entry.meta.pop();
     entry.idMap.delete(id);
     entry.bin = entry.bin.slice(0, entry.ids.length * bpv);
-    this._adapter.writeBin(this._binFile(col), entry.bin);
     entry.dirty = true;
     return true;
   }
@@ -1906,9 +1909,11 @@ class CloudflareKVAdapter {
    * @param {string} [prefix]  Prefijo para las keys (ej: 'vectors/')
    */
   constructor(kv, prefix = '') {
-    this.kv     = kv;
-    this.prefix = prefix;
-    this._cache = new Map(); // key → { type: 'bin'|'json', data }
+    this.kv       = kv;
+    this.prefix   = prefix;
+    this._cache   = new Map(); // key → { type: 'bin'|'json', data }
+    this._dirty   = new Set(); // keys modified since last persist()
+    this._deleted = new Set(); // keys removed since last persist()
   }
 
   _key(filename) { return this.prefix + filename; }
@@ -1928,6 +1933,8 @@ class CloudflareKVAdapter {
         const val = await this.kv.get(key, 'arrayBuffer');
         if (val) this._cache.set(f, { type: 'bin', data: val });
       }
+      // Preloaded keys are clean
+      this._dirty.delete(f);
     });
     await Promise.all(promises);
   }
@@ -1959,6 +1966,8 @@ class CloudflareKVAdapter {
 
   writeBin(filename, buffer) {
     this._cache.set(filename, { type: 'bin', data: buffer });
+    this._dirty.add(filename);
+    this._deleted.delete(filename);
   }
 
   readJson(filename) {
@@ -1968,10 +1977,14 @@ class CloudflareKVAdapter {
 
   writeJson(filename, data) {
     this._cache.set(filename, { type: 'json', data });
+    this._dirty.add(filename);
+    this._deleted.delete(filename);
   }
 
   delete(filename) {
     this._cache.delete(filename);
+    this._dirty.delete(filename);
+    this._deleted.add(filename);
   }
 
   /**
@@ -1979,8 +1992,11 @@ class CloudflareKVAdapter {
    * Llamar despues de store.flush().
    */
   async persist() {
+    if (this._dirty.size === 0 && this._deleted.size === 0) return;
     const promises = [];
-    for (const [filename, entry] of this._cache) {
+    for (const filename of this._dirty) {
+      const entry = this._cache.get(filename);
+      if (!entry) continue;
       const key = this._key(filename);
       if (entry.type === 'json') {
         promises.push(this.kv.put(key, JSON.stringify(entry.data)));
@@ -1988,14 +2004,21 @@ class CloudflareKVAdapter {
         promises.push(this.kv.put(key, entry.data));
       }
     }
+    for (const filename of this._deleted) {
+      promises.push(this.kv.delete(this._key(filename)));
+    }
     await Promise.all(promises);
+    this._dirty.clear();
+    this._deleted.clear();
   }
 
   /**
-   * Elimina una key de KV.
+   * Elimina una key de KV y de cache inmediatamente (fuera del ciclo persist).
    */
   async deleteFromKV(filename) {
     this._cache.delete(filename);
+    this._dirty.delete(filename);
+    this._deleted.delete(filename);
     await this.kv.delete(this._key(filename));
   }
 }
