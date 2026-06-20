@@ -1675,28 +1675,18 @@ class IVFIndex {
 
   _indexFile(col) { return `${col}.ivf.json`; }
 
-  // Distancia² mínima del punto `i` a los `c` centroides ya elegidos (k-means++).
-  _nearestCentroidDistSq(flat, i, centroids, c, dim) {
-    let minD = Infinity;
-    for (let cc = 0; cc < c; cc++) {
-      const distSq = euclideanDistSq(flat, i * dim, centroids, cc * dim, dim);
-      if (distSq < minD) minD = distSq;
-    }
-    return minD;
-  }
-
   _kmeansInit(flat, n, dim, k) {
     const centroids = new Float64Array(k * dim);
     const first = Math.floor(Math.random() * n);
     for (let d = 0; d < dim; d++) centroids[d] = flat[first * dim + d];
+    // dists[i] = distancia² mínima de i a los centroides ya elegidos. Se mantiene INCREMENTALMENTE
+    // (min con el nuevo centroide) en O(n·k·dim) en vez de recomputar todo en O(n·k²·dim).
+    // Mismos valores y mismo orden de Math.random que la versión que recomputaba -> idéntico.
     const dists = new Float64Array(n);
+    for (let i = 0; i < n; i++) dists[i] = euclideanDistSq(flat, i * dim, centroids, 0, dim);
     for (let c = 1; c < k; c++) {
       let total = 0;
-      for (let i = 0; i < n; i++) {
-        const minD = this._nearestCentroidDistSq(flat, i, centroids, c, dim);
-        dists[i] = minD;
-        total += minD;
-      }
+      for (let i = 0; i < n; i++) total += dists[i];
       let r = Math.random() * total;
       let chosen = 0;
       for (let i = 0; i < n; i++) {
@@ -1704,6 +1694,10 @@ class IVFIndex {
         if (r <= 0) { chosen = i; break; }
       }
       for (let d = 0; d < dim; d++) centroids[c * dim + d] = flat[chosen * dim + d];
+      for (let i = 0; i < n; i++) {
+        const d2 = euclideanDistSq(flat, i * dim, centroids, c * dim, dim);
+        if (d2 < dists[i]) dists[i] = d2;
+      }
     }
     return centroids;
   }
@@ -1832,19 +1826,33 @@ class IVFIndex {
     return { numClusters: idx.centroids.length, numProbes: this.numProbes };
   }
 
+  // Lista invertida cluster -> índices de sus miembros, calculada UNA vez y cacheada en el índice.
+  // Evita el barrido O(n) de assignments en cada query.
+  _clusterMembers(idx) {
+    if (idx._members) return idx._members;
+    const members = Array.from({ length: idx.centroids.length }, () => []);
+    const a = idx.assignments;
+    for (let i = 0; i < a.length; i++) members[a[i]].push(i);
+    idx._members = members;
+    return members;
+  }
+
   _getCandidates(col, query) {
     const idx  = this._loadIndex(col);
     if (!idx) throw new Error(`No hay índice IVF para: ${col}. Llamá a .build() primero.`);
-    const { centroids, assignments } = idx;
+    const { centroids } = idx;
     const dims = idx.sampleDims ?? query.length;
     const centDists = centroids.map((c, i) => ({ i, d: euclideanDist(query, c, dims) }));
     centDists.sort((a, b) => a.d - b.d);
-    const probeClusters = new Set(centDists.slice(0, this.numProbes).map(x => x.i));
+    const probeClusters = centDists.slice(0, this.numProbes).map(x => x.i);
+    const members = this._clusterMembers(idx);
     const entry = this.store._load(col);
     const candidateIdxs = [];
-    for (let i = 0; i < assignments.length; i++) {
-      if (probeClusters.has(assignments[i])) candidateIdxs.push(i);
+    for (const cluster of probeClusters) {
+      const m = members[cluster];
+      for (let j = 0; j < m.length; j++) candidateIdxs.push(m[j]);
     }
+    candidateIdxs.sort((a, b) => a - b); // mismo orden que el barrido original (equivalencia exacta)
     return { entry, candidateIdxs };
   }
 
