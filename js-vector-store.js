@@ -355,6 +355,124 @@ class MemoryStorageAdapter {
   listKeys() {
     return [...new Set([...this._bins.keys(), ...this._jsons.keys()])];
   }
+
+  /**
+   * Serializa TODO el contenido (bins + jsons) a UN solo ArrayBuffer portable ("el archivo").
+   * Modelo SQLite: shippeás este blob a un browser/Worker y lo consultás sin servidor.
+   * @returns {ArrayBuffer}
+   */
+  toBundle() {
+    return packBundle(this._bins, this._jsons);
+  }
+
+  /**
+   * Construye un MemoryStorageAdapter desde un bundle (ArrayBuffer) creado por toBundle().
+   * @param {ArrayBuffer} arrayBuffer
+   * @returns {MemoryStorageAdapter}
+   */
+  static fromBundle(arrayBuffer) {
+    const adapter = new MemoryStorageAdapter();
+    const { bins, jsons } = unpackBundle(arrayBuffer);
+    adapter._bins = bins;
+    adapter._jsons = jsons;
+    return adapter;
+  }
+}
+
+// ─── Bundle: empaqueta el storage en un solo ArrayBuffer (portable, zero-dep) ─────────────────
+// Formato:  "JVSB" | ver:u8 | flags:u8 | count:u32 | [ type:u8, keyLen:u32, dataLen:u32, key, data ]*
+//   type 0 = bin (bytes crudos del ArrayBuffer); type 1 = json (UTF-8 de JSON.stringify)
+const _BUNDLE_MAGIC = 0x4a565342; // "JVSB"
+
+function packBundle(bins, jsons) {
+  const enc = new TextEncoder();
+  const entries = [];
+  for (const [k, ab] of bins) entries.push([0, enc.encode(k), new Uint8Array(ab)]);
+  for (const [k, obj] of jsons) entries.push([1, enc.encode(k), enc.encode(JSON.stringify(obj))]);
+  let size = 10;
+  for (const [, key, data] of entries) size += 9 + key.length + data.length;
+  const buf = new ArrayBuffer(size);
+  const view = new DataView(buf);
+  const out = new Uint8Array(buf);
+  view.setUint32(0, _BUNDLE_MAGIC, false);
+  view.setUint8(4, 1);
+  view.setUint8(5, 0);
+  view.setUint32(6, entries.length, true);
+  let off = 10;
+  for (const [type, key, data] of entries) {
+    view.setUint8(off, type);
+    view.setUint32(off + 1, key.length, true);
+    view.setUint32(off + 5, data.length, true);
+    off += 9;
+    out.set(key, off); off += key.length;
+    out.set(data, off); off += data.length;
+  }
+  return buf;
+}
+
+function unpackBundle(arrayBuffer) {
+  const view = new DataView(arrayBuffer);
+  if (view.getUint32(0, false) !== _BUNDLE_MAGIC) throw new Error("bundle inválido: magic incorrecto");
+  const dec = new TextDecoder();
+  const count = view.getUint32(6, true);
+  const bins = new Map();
+  const jsons = new Map();
+  let off = 10;
+  for (let i = 0; i < count; i++) {
+    const type = view.getUint8(off);
+    const keyLen = view.getUint32(off + 1, true);
+    const dataLen = view.getUint32(off + 5, true);
+    off += 9;
+    const key = dec.decode(new Uint8Array(arrayBuffer, off, keyLen)); off += keyLen;
+    const bytes = new Uint8Array(arrayBuffer.slice(off, off + dataLen)); off += dataLen;
+    if (type === 0) bins.set(key, bytes.buffer);          // ArrayBuffer independiente (offset 0)
+    else jsons.set(key, JSON.parse(dec.decode(bytes)));
+  }
+  return { bins, jsons };
+}
+
+// ─── Cargar un bundle desde una URL (read-only en browser/Worker/Node 18+) ────────────────────
+async function fetchBundle(url, fetchOpts) {
+  const res = await fetch(url, fetchOpts);
+  if (!res.ok) throw new Error(`fetchBundle: HTTP ${res.status} en ${url}`);
+  return res.arrayBuffer();
+}
+
+// ─── Persistencia en browser vía IndexedDB (un blob por nombre). Requiere `indexedDB` global. ──
+function _openBundleDB(dbName) {
+  return new Promise((resolve, reject) => {
+    const req = indexedDB.open(dbName || "jvs-bundles", 1);
+    req.onupgradeneeded = () => { if (!req.result.objectStoreNames.contains("bundles")) req.result.createObjectStore("bundles"); };
+    req.onsuccess = () => resolve(req.result);
+    req.onerror = () => reject(req.error);
+  });
+}
+function _idbReq(store, method, ...args) {
+  return new Promise((resolve, reject) => {
+    const r = store[method](...args);
+    r.onsuccess = () => resolve(r.result);
+    r.onerror = () => reject(r.error);
+  });
+}
+async function idbSaveBundle(name, arrayBuffer, dbName) {
+  const db = await _openBundleDB(dbName);
+  try { await _idbReq(db.transaction("bundles", "readwrite").objectStore("bundles"), "put", arrayBuffer, name); }
+  finally { db.close(); }
+}
+async function idbLoadBundle(name, dbName) {
+  const db = await _openBundleDB(dbName);
+  try { return (await _idbReq(db.transaction("bundles").objectStore("bundles"), "get", name)) || null; }
+  finally { db.close(); }
+}
+async function idbListBundles(dbName) {
+  const db = await _openBundleDB(dbName);
+  try { return await _idbReq(db.transaction("bundles").objectStore("bundles"), "getAllKeys"); }
+  finally { db.close(); }
+}
+async function idbDeleteBundle(name, dbName) {
+  const db = await _openBundleDB(dbName);
+  try { await _idbReq(db.transaction("bundles", "readwrite").objectStore("bundles"), "delete", name); }
+  finally { db.close(); }
 }
 
 // ---------------------------------------------------------------------------
@@ -2420,7 +2538,7 @@ class Reranker {
 // EXPORTS
 // ---------------------------------------------------------------------------
 
-module.exports = {
+const _api = {
   VectorStore,
   QuantizedStore,
   BinaryQuantizedStore,
@@ -2442,4 +2560,16 @@ module.exports = {
   manhattanDist,
   computeScore,
   matchFilter,
+  // Bundle portable (modelo "SQLite": un archivo, corre en browser/Worker/Node)
+  packBundle,
+  unpackBundle,
+  fetchBundle,
+  idbSaveBundle,
+  idbLoadBundle,
+  idbListBundles,
+  idbDeleteBundle,
 };
+
+// UMD-lite: CommonJS (Node / bundler) o, en browser/Worker sin módulos, global `JSVectorStore`.
+if (typeof module !== "undefined" && module.exports) module.exports = _api;
+else if (typeof globalThis !== "undefined") globalThis.JSVectorStore = _api;
