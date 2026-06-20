@@ -1637,25 +1637,19 @@ class IVFIndex {
     return { centroids: centroidArrays, assignments: Array.from(assignments) };
   }
 
-  build(col, sampleDims = 128) {
-    const entry = this.store._load(col);
-    const n     = entry.ids.length;
-    if (n === 0) throw new Error(`Colección vacía: ${col}`);
-    if (entry.pending && entry.pending.length > 0) this.store._flushCol(col, entry);
-
-    const dim = this.store.dim;
-    let flat;
-
+  // Dequantiza los `n` vectores de `col` a un Float64Array(n*dim) plano, según el tipo de store.
+  // Early-returns por tipo (evita el anidamiento del else-if); lógica idéntica al original.
+  _dequantizeFlat(col, entry, n, dim) {
+    const flat = new Float64Array(n * dim);
     if (this.store instanceof PolarQuantizedStore || this.store instanceof BinaryQuantizedStore) {
-      // Dequantizar a flat Float64Array (generico para cualquier quantized store)
-      flat = new Float64Array(n * dim);
       for (let i = 0; i < n; i++) {
         const vec = this.store._readVec(col, i);
         const iOff = i * dim;
         for (let d = 0; d < dim; d++) flat[iOff + d] = vec[d];
       }
-    } else if (this.store instanceof QuantizedStore) {
-      flat = new Float64Array(n * dim);
+      return flat;
+    }
+    if (this.store instanceof QuantizedStore) {
       const stride = this.store._stride;
       for (let i = 0; i < n; i++) {
         const offset = i * stride;
@@ -1669,11 +1663,21 @@ class IVFIndex {
           flat[iOff + d] = ((int8[d] + 128) / 255) * range + min;
         }
       }
-    } else {
-      flat = new Float64Array(n * dim);
-      const f32 = new Float32Array(entry.bin);
-      for (let i = 0; i < n * dim; i++) flat[i] = f32[i];
+      return flat;
     }
+    const f32 = new Float32Array(entry.bin);
+    for (let i = 0; i < n * dim; i++) flat[i] = f32[i];
+    return flat;
+  }
+
+  build(col, sampleDims = 128) {
+    const entry = this.store._load(col);
+    const n     = entry.ids.length;
+    if (n === 0) throw new Error(`Colección vacía: ${col}`);
+    if (entry.pending && entry.pending.length > 0) this.store._flushCol(col, entry);
+
+    const dim = this.store.dim;
+    const flat = this._dequantizeFlat(col, entry, n, dim);
 
     const { centroids, assignments } = this._kmeans(flat, n, dim, this.numClusters);
     const index = { centroids, assignments, sampleDims };
