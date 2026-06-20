@@ -6,6 +6,9 @@
   "exports": {
     ".": "./js-vector-store.js"
   },
+  "scripts": {
+    "bench": "node benchmark-offline.js"
+  },
   "keywords": [
     "vector-store",
     "vector-database",
