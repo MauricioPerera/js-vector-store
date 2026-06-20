@@ -1579,35 +1579,52 @@ class IVFIndex {
     return centroids;
   }
 
+  // Índice del centroide más cercano al punto en `iOff` (distancia² euclídea). Desempata por el
+  // primer centroide con distancia estrictamente menor (igual que el original).
+  _nearestCentroid(flat, iOff, centroids, actualK, dim) {
+    let bestC = 0, bestD = Infinity;
+    for (let c = 0; c < actualK; c++) {
+      const d = euclideanDistSq(flat, iOff, centroids, c * dim, dim);
+      if (d < bestD) { bestD = d; bestC = c; }
+    }
+    return bestC;
+  }
+
+  // Paso de asignación de Lloyd: asigna cada punto a su centroide más cercano. Devuelve si cambió.
+  _assignStep(flat, n, dim, actualK, centroids, assignments) {
+    let changed = false;
+    for (let i = 0; i < n; i++) {
+      const bestC = this._nearestCentroid(flat, i * dim, centroids, actualK, dim);
+      if (assignments[i] !== bestC) { assignments[i] = bestC; changed = true; }
+    }
+    return changed;
+  }
+
+  // Paso de actualización: cada centroide = media de sus puntos asignados (in situ en `centroids`).
+  _updateCentroids(flat, n, dim, actualK, assignments, centroids) {
+    const sums   = new Float64Array(actualK * dim);
+    const counts = new Int32Array(actualK);
+    for (let i = 0; i < n; i++) {
+      const c = assignments[i];
+      counts[c]++;
+      const iOff = i * dim, cOff = c * dim;
+      for (let d = 0; d < dim; d++) sums[cOff + d] += flat[iOff + d];
+    }
+    for (let c = 0; c < actualK; c++) {
+      if (counts[c] === 0) continue;
+      const cOff = c * dim;
+      for (let d = 0; d < dim; d++) centroids[cOff + d] = sums[cOff + d] / counts[c];
+    }
+  }
+
   _kmeans(flat, n, dim, k, maxIter = 20) {
-    const actualK    = Math.min(k, n);
-    let centroids    = this._kmeansInit(flat, n, dim, actualK);
+    const actualK     = Math.min(k, n);
+    const centroids   = this._kmeansInit(flat, n, dim, actualK);
     const assignments = new Int32Array(n);
     for (let iter = 0; iter < maxIter; iter++) {
-      let changed = false;
-      for (let i = 0; i < n; i++) {
-        let bestC = 0, bestD = Infinity;
-        for (let c = 0; c < actualK; c++) {
-          const d = euclideanDistSq(flat, i * dim, centroids, c * dim, dim);
-          if (d < bestD) { bestD = d; bestC = c; }
-        }
-        if (assignments[i] !== bestC) { assignments[i] = bestC; changed = true; }
-      }
+      const changed = this._assignStep(flat, n, dim, actualK, centroids, assignments);
       if (!changed) break;
-      const sums   = new Float64Array(actualK * dim);
-      const counts = new Int32Array(actualK);
-      for (let i = 0; i < n; i++) {
-        const c = assignments[i];
-        counts[c]++;
-        const iOff = i * dim, cOff = c * dim;
-        for (let d = 0; d < dim; d++) sums[cOff + d] += flat[iOff + d];
-      }
-      for (let c = 0; c < actualK; c++) {
-        if (counts[c] > 0) {
-          const cOff = c * dim;
-          for (let d = 0; d < dim; d++) centroids[cOff + d] = sums[cOff + d] / counts[c];
-        }
-      }
+      this._updateCentroids(flat, n, dim, actualK, assignments, centroids);
     }
     const centroidArrays = [];
     for (let c = 0; c < actualK; c++) {
