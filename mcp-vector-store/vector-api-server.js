@@ -3,6 +3,7 @@ const url = require("url");
 const path = require("path");
 
 const { VectorStore, QuantizedStore, BinaryQuantizedStore, BM25Index, HybridSearch, FileStorageAdapter } = require(path.join(__dirname, "js-vector-store.js"));
+const { resolveApiRoute } = require(path.join(__dirname, "api-routes.js"));
 
 const PORT = process.env.PORT || 3000;
 const DATA_DIR = process.env.DATA_DIR || path.join(__dirname, "vector-data");
@@ -48,10 +49,78 @@ async function readBody(req) {
   try { return JSON.parse(body); } catch { return {}; }
 }
 
+// ─── Handlers (acción -> función). Comparten el estado de módulo (collections, bm25s, …).
+// Las rutas de colección reciben `store` ya resuelto por el dispatcher. ────────────────────
+
+function aHealth(req, res) {
+  return send(res, 200, { status: "ok", api: "js-vector-store-headless", ollama: OLLAMA_MODEL });
+}
+
+function aList(req, res) {
+  const result = [];
+  for (const [name, store] of collections) {
+    const ids = store.ids(name);
+    result.push({ name, count: ids.length, dimension: store.dim || store.dimension, backend: store.constructor.name });
+  }
+  return send(res, 200, { collections: result });
+}
+
+async function aIndex(req, res, route, query, store) {
+  const body = await readBody(req);
+  const embedding = body.vector || await generateEmbedding(body.text);
+  store.set(route.colName, body.id, embedding, body.metadata || {});
+  store.flush();
+  const bm25 = bm25s.get(route.colName);
+  if (bm25 && body.text) bm25.addDocument(route.colName, body.id, body.text);
+  return send(res, 201, { indexed: body.id, dim: embedding.length });
+}
+
+async function aSearchEmpty(res, store, colName) {
+  const ids = store.ids(colName);
+  return send(res, 200, { collection: colName, count: ids.length, ids: ids.slice(0, 100) });
+}
+
+async function runSearchMode(query, store, colName, q) {
+  if (query.mode === "bm25") {
+    return getBM25(colName).search(colName, q, Number(query.limit) || 10);
+  }
+  if (query.mode === "hybrid") {
+    const bm25 = getBM25(colName);
+    const qVec = await generateEmbedding(q);
+    return new HybridSearch(store, bm25, "rrf").search(colName, qVec, q, Number(query.limit) || 10);
+  }
+  const qVec = await generateEmbedding(q);
+  return store.search(colName, qVec, Number(query.limit) || 10);
+}
+
+async function aSearch(req, res, route, query, store) {
+  const q = query.q || query.query;
+  if (!q) return aSearchEmpty(res, store, route.colName);
+  const results = await runSearchMode(query, store, route.colName, q);
+  return send(res, 200, {
+    collection: route.colName, query: q, mode: query.mode || "vector",
+    results: results.map(r => ({ id: r.id, score: r.score, metadata: r.metadata })),
+  });
+}
+
+function aGetById(req, res, route, query, store) {
+  const doc = store.get(route.colName, route.docId);
+  if (!doc) return send(res, 404, { error: "Not found" });
+  return send(res, 200, doc);
+}
+
+function aDelete(req, res, route, query, store) {
+  store.remove(route.colName, route.docId);
+  store.flush();
+  return send(res, 200, { deleted: route.docId });
+}
+
+const API_HANDLERS = {
+  health: aHealth, list: aList, index: aIndex, search: aSearch, getById: aGetById, delete: aDelete,
+};
+
 const server = http.createServer(async (req, res) => {
   const parsed = url.parse(req.url, true);
-  const pathname = parsed.pathname;
-  const query = parsed.query;
 
   if (req.method === "OPTIONS") {
     res.writeHead(200, { "Access-Control-Allow-Origin": "*", "Access-Control-Allow-Methods": "GET,POST,PUT,DELETE,OPTIONS", "Access-Control-Allow-Headers": "Content-Type" });
@@ -59,74 +128,12 @@ const server = http.createServer(async (req, res) => {
   }
 
   try {
-    // Health
-    if (pathname === "/health") return send(res, 200, { status: "ok", api: "js-vector-store-headless", ollama: OLLAMA_MODEL });
-
-    // List collections
-    if (pathname === "/collections") {
-      const result = [];
-      for (const [name, store] of collections) {
-        const ids = store.ids(name);
-        result.push({ name, count: ids.length, dimension: store.dim || store.dimension, backend: store.constructor.name });
-      }
-      return send(res, 200, { collections: result });
-    }
-
-    const m = pathname.match(/^\/collections\/([^\/]+)(?:\/([^\/]+))?$/);
-    if (!m) return send(res, 404, { error: "Not found" });
-
-    const [, colName, docId] = m;
-    const store = getCollection(colName);
-
-    // POST /collections/:name - index text with embedding
-    if (req.method === "POST" && !docId) {
-      const body = await readBody(req);
-      const embedding = body.vector || await generateEmbedding(body.text);
-      store.set(colName, body.id, embedding, body.metadata || {});
-      store.flush();
-      const bm25 = bm25s.get(colName);
-      if (bm25 && body.text) bm25.addDocument(colName, body.id, body.text);
-      return send(res, 201, { indexed: body.id, dim: embedding.length });
-    }
-
-    // GET /collections/:name - search
-    if (req.method === "GET" && !docId) {
-      const q = query.q || query.query;
-      if (!q) {
-        const ids = store.ids(colName);
-        return send(res, 200, { collection: colName, count: ids.length, ids: ids.slice(0, 100) });
-      }
-      let results;
-      if (query.mode === "bm25") {
-        const bm25 = getBM25(colName);
-        results = bm25.search(colName, q, Number(query.limit) || 10);
-      } else if (query.mode === "hybrid") {
-        const bm25 = getBM25(colName);
-        const qVec = await generateEmbedding(q);
-        const hybrid = new HybridSearch(store, bm25, "rrf");
-        results = hybrid.search(colName, qVec, q, Number(query.limit) || 10);
-      } else {
-        const qVec = await generateEmbedding(q);
-        results = store.search(colName, qVec, Number(query.limit) || 10);
-      }
-      return send(res, 200, { collection: colName, query: q, mode: query.mode || "vector", results: results.map(r => ({ id: r.id, score: r.score, metadata: r.metadata })) });
-    }
-
-    // GET /collections/:name/:id - get by id
-    if (req.method === "GET" && docId) {
-      const doc = store.get(colName, docId);
-      if (!doc) return send(res, 404, { error: "Not found" });
-      return send(res, 200, doc);
-    }
-
-    // DELETE /collections/:name/:id
-    if (req.method === "DELETE" && docId) {
-      store.remove(colName, docId);
-      store.flush();
-      return send(res, 200, { deleted: docId });
-    }
-
-    return send(res, 405, { error: "Method not allowed" });
+    const route = resolveApiRoute(req.method, parsed.pathname);
+    if (route.action === "notFound") return send(res, 404, { error: "Not found" });
+    // Igual que el original: cualquier path de colección obtiene/crea el store antes del dispatch.
+    const store = route.colName ? getCollection(route.colName) : null;
+    if (route.action === "methodNotAllowed") return send(res, 405, { error: "Method not allowed" });
+    return await API_HANDLERS[route.action](req, res, route, parsed.query, store);
   } catch (err) {
     console.error("API Error:", err.message);
     send(res, 500, { error: err.message });

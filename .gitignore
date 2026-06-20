@@ -1,3 +1,4 @@
 node_modules/
 .claude/
 *.tmp
+examples/cloudflare-r2/index.jvs

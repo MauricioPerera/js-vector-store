@@ -1,0 +1,13 @@
+name = "jvs-r2-search"
+main = "index.js"
+compatibility_date = "2024-09-01"
+
+# Bucket R2 donde vive el índice prebuilt (.jvs). Crear con:  wrangler r2 bucket create jvs-index
+[[r2_buckets]]
+binding = "INDEX"
+bucket_name = "jvs-index"
+
+[vars]
+INDEX_KEY = "index.jvs"
+DIMENSIONS = "256"
+# API_TOKEN = "..."   # opcional: si se define, /search exige Authorization: Bearer <token>

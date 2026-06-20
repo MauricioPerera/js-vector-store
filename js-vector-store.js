@@ -181,63 +181,52 @@ function computeScore(a, b, dims, metric) {
 //   { $or: [{ category: 'tech' }, { category: 'science' }] }
 //   { name: { $regex: '^AI' } }                   → regex match
 
+// Comparadores de campo: tabla de despacho (cada operador es una unidad pequeña y testeable).
+// Devuelven true si el valor CUMPLE el operador. Semántica idéntica al switch original.
+const FILTER_COMPARATORS = {
+  $eq:     (val, t) => val === t,
+  $ne:     (val, t) => val !== t,
+  $gt:     (val, t) => val > t,
+  $gte:    (val, t) => val >= t,
+  $lt:     (val, t) => val < t,
+  $lte:    (val, t) => val <= t,
+  $in:     (val, t) => Array.isArray(t) && t.includes(val),
+  $nin:    (val, t) => !(Array.isArray(t) && t.includes(val)),
+  $exists: (val, t) => (val !== undefined) === t,
+  $regex:  (val, t) => {
+    const re = typeof t === 'string' ? new RegExp(t) : t;
+    if (re.global || re.sticky) re.lastIndex = 0;
+    return re.test(String(val ?? ''));
+  },
+};
+
+// Operadores lógicos: tabla de despacho. Devuelven true si el metadata CUMPLE el operador.
+const FILTER_LOGICAL = {
+  $and: (metadata, subs) => Array.isArray(subs) && subs.every((s) => matchFilter(metadata, s)),
+  $or:  (metadata, subs) => Array.isArray(subs) && subs.some((s) => matchFilter(metadata, s)),
+  $not: (metadata, sub) => !matchFilter(metadata, sub),
+};
+
+// Una condición de campo: igualdad simple, o un objeto-operador (todos sus operadores deben cumplir).
+function matchFieldCondition(val, cond) {
+  if (cond === null || typeof cond !== 'object') return val === cond;
+  for (const op of Object.keys(cond)) {
+    const cmp = FILTER_COMPARATORS[op];
+    if (cmp && !cmp(val, cond[op])) return false; // operador desconocido: se ignora (como el default)
+  }
+  return true;
+}
+
 function matchFilter(metadata, filter) {
   if (!filter || typeof filter !== 'object') return true;
   if (!metadata) metadata = {};
-
   for (const key of Object.keys(filter)) {
-    // Logical operators
-    if (key === '$and') {
-      if (!Array.isArray(filter.$and)) return false;
-      for (const sub of filter.$and) {
-        if (!matchFilter(metadata, sub)) return false;
-      }
+    const logical = FILTER_LOGICAL[key];
+    if (logical) {
+      if (!logical(metadata, filter[key])) return false;
       continue;
     }
-    if (key === '$or') {
-      if (!Array.isArray(filter.$or)) return false;
-      let any = false;
-      for (const sub of filter.$or) {
-        if (matchFilter(metadata, sub)) { any = true; break; }
-      }
-      if (!any) return false;
-      continue;
-    }
-    if (key === '$not') {
-      if (matchFilter(metadata, filter.$not)) return false;
-      continue;
-    }
-
-    const val   = metadata[key];
-    const cond  = filter[key];
-
-    // Simple equality
-    if (cond === null || typeof cond !== 'object') {
-      if (val !== cond) return false;
-      continue;
-    }
-
-    // Operator object
-    for (const op of Object.keys(cond)) {
-      const target = cond[op];
-      switch (op) {
-        case '$eq':     if (val !== target) return false; break;
-        case '$ne':     if (val === target) return false; break;
-        case '$gt':     if (!(val > target)) return false; break;
-        case '$gte':    if (!(val >= target)) return false; break;
-        case '$lt':     if (!(val < target)) return false; break;
-        case '$lte':    if (!(val <= target)) return false; break;
-        case '$in':     if (!Array.isArray(target) || !target.includes(val)) return false; break;
-        case '$nin':    if (Array.isArray(target) && target.includes(val)) return false; break;
-        case '$exists': if ((val !== undefined) !== target) return false; break;
-        case '$regex': {
-          const re = typeof target === 'string' ? new RegExp(target) : target;
-          if (!re.test(String(val ?? ''))) return false;
-          break;
-        }
-        default: break;
-      }
-    }
+    if (!matchFieldCondition(metadata[key], filter[key])) return false;
   }
   return true;
 }
@@ -355,6 +344,124 @@ class MemoryStorageAdapter {
   listKeys() {
     return [...new Set([...this._bins.keys(), ...this._jsons.keys()])];
   }
+
+  /**
+   * Serializa TODO el contenido (bins + jsons) a UN solo ArrayBuffer portable ("el archivo").
+   * Modelo SQLite: shippeás este blob a un browser/Worker y lo consultás sin servidor.
+   * @returns {ArrayBuffer}
+   */
+  toBundle() {
+    return packBundle(this._bins, this._jsons);
+  }
+
+  /**
+   * Construye un MemoryStorageAdapter desde un bundle (ArrayBuffer) creado por toBundle().
+   * @param {ArrayBuffer} arrayBuffer
+   * @returns {MemoryStorageAdapter}
+   */
+  static fromBundle(arrayBuffer) {
+    const adapter = new MemoryStorageAdapter();
+    const { bins, jsons } = unpackBundle(arrayBuffer);
+    adapter._bins = bins;
+    adapter._jsons = jsons;
+    return adapter;
+  }
+}
+
+// ─── Bundle: empaqueta el storage en un solo ArrayBuffer (portable, zero-dep) ─────────────────
+// Formato:  "JVSB" | ver:u8 | flags:u8 | count:u32 | [ type:u8, keyLen:u32, dataLen:u32, key, data ]*
+//   type 0 = bin (bytes crudos del ArrayBuffer); type 1 = json (UTF-8 de JSON.stringify)
+const _BUNDLE_MAGIC = 0x4a565342; // "JVSB"
+
+function packBundle(bins, jsons) {
+  const enc = new TextEncoder();
+  const entries = [];
+  for (const [k, ab] of bins) entries.push([0, enc.encode(k), new Uint8Array(ab)]);
+  for (const [k, obj] of jsons) entries.push([1, enc.encode(k), enc.encode(JSON.stringify(obj))]);
+  let size = 10;
+  for (const [, key, data] of entries) size += 9 + key.length + data.length;
+  const buf = new ArrayBuffer(size);
+  const view = new DataView(buf);
+  const out = new Uint8Array(buf);
+  view.setUint32(0, _BUNDLE_MAGIC, false);
+  view.setUint8(4, 1);
+  view.setUint8(5, 0);
+  view.setUint32(6, entries.length, true);
+  let off = 10;
+  for (const [type, key, data] of entries) {
+    view.setUint8(off, type);
+    view.setUint32(off + 1, key.length, true);
+    view.setUint32(off + 5, data.length, true);
+    off += 9;
+    out.set(key, off); off += key.length;
+    out.set(data, off); off += data.length;
+  }
+  return buf;
+}
+
+function unpackBundle(arrayBuffer) {
+  const view = new DataView(arrayBuffer);
+  if (view.getUint32(0, false) !== _BUNDLE_MAGIC) throw new Error("bundle inválido: magic incorrecto");
+  const dec = new TextDecoder();
+  const count = view.getUint32(6, true);
+  const bins = new Map();
+  const jsons = new Map();
+  let off = 10;
+  for (let i = 0; i < count; i++) {
+    const type = view.getUint8(off);
+    const keyLen = view.getUint32(off + 1, true);
+    const dataLen = view.getUint32(off + 5, true);
+    off += 9;
+    const key = dec.decode(new Uint8Array(arrayBuffer, off, keyLen)); off += keyLen;
+    const bytes = new Uint8Array(arrayBuffer.slice(off, off + dataLen)); off += dataLen;
+    if (type === 0) bins.set(key, bytes.buffer);          // ArrayBuffer independiente (offset 0)
+    else jsons.set(key, JSON.parse(dec.decode(bytes)));
+  }
+  return { bins, jsons };
+}
+
+// ─── Cargar un bundle desde una URL (read-only en browser/Worker/Node 18+) ────────────────────
+async function fetchBundle(url, fetchOpts) {
+  const res = await fetch(url, fetchOpts);
+  if (!res.ok) throw new Error(`fetchBundle: HTTP ${res.status} en ${url}`);
+  return res.arrayBuffer();
+}
+
+// ─── Persistencia en browser vía IndexedDB (un blob por nombre). Requiere `indexedDB` global. ──
+function _openBundleDB(dbName) {
+  return new Promise((resolve, reject) => {
+    const req = indexedDB.open(dbName || "jvs-bundles", 1);
+    req.onupgradeneeded = () => { if (!req.result.objectStoreNames.contains("bundles")) req.result.createObjectStore("bundles"); };
+    req.onsuccess = () => resolve(req.result);
+    req.onerror = () => reject(req.error);
+  });
+}
+function _idbReq(store, method, ...args) {
+  return new Promise((resolve, reject) => {
+    const r = store[method](...args);
+    r.onsuccess = () => resolve(r.result);
+    r.onerror = () => reject(r.error);
+  });
+}
+async function idbSaveBundle(name, arrayBuffer, dbName) {
+  const db = await _openBundleDB(dbName);
+  try { await _idbReq(db.transaction("bundles", "readwrite").objectStore("bundles"), "put", arrayBuffer, name); }
+  finally { db.close(); }
+}
+async function idbLoadBundle(name, dbName) {
+  const db = await _openBundleDB(dbName);
+  try { return (await _idbReq(db.transaction("bundles").objectStore("bundles"), "get", name)) || null; }
+  finally { db.close(); }
+}
+async function idbListBundles(dbName) {
+  const db = await _openBundleDB(dbName);
+  try { return await _idbReq(db.transaction("bundles").objectStore("bundles"), "getAllKeys"); }
+  finally { db.close(); }
+}
+async function idbDeleteBundle(name, dbName) {
+  const db = await _openBundleDB(dbName);
+  try { await _idbReq(db.transaction("bundles", "readwrite").objectStore("bundles"), "delete", name); }
+  finally { db.close(); }
 }
 
 // ---------------------------------------------------------------------------
@@ -471,27 +578,32 @@ class VectorStore {
     return buf;
   }
 
+  // Sobrescribe in situ el vector ya commiteado en `existing` (solo si hay buffer binario).
+  _writeCommittedVector(entry, existing, vector) {
+    if (!entry.bin) return;
+    const f32 = new Float32Array(entry.bin, existing * this._stride, this.dim);
+    for (let d = 0; d < this.dim; d++) f32[d] = vector[d] ?? 0;
+  }
+
   set(col, id, vector, metadata = {}) {
     const entry    = this._load(col);
     const existing = entry.idMap.get(id);
-    if (existing !== undefined) {
-      const committed = entry.ids.length - entry.pending.length;
-      if (existing < committed) {
-        if (entry.bin) {
-          const f32 = new Float32Array(entry.bin, existing * this._stride, this.dim);
-          for (let d = 0; d < this.dim; d++) f32[d] = vector[d] ?? 0;
-        }
-      } else {
-        entry.pending[existing - committed].vector = vector;
-      }
-      entry.meta[existing] = metadata;
-    } else {
+    if (existing === undefined) {
       const idx = entry.ids.length;
       entry.ids.push(id);
       entry.meta.push(metadata);
       entry.idMap.set(id, idx);
       entry.pending.push({ id, vector, metadata });
+      entry.dirty = true;
+      return;
     }
+    const committed = entry.ids.length - entry.pending.length;
+    if (existing < committed) {
+      this._writeCommittedVector(entry, existing, vector);
+    } else {
+      entry.pending[existing - committed].vector = vector;
+    }
+    entry.meta[existing] = metadata;
     entry.dirty = true;
   }
 
@@ -1080,26 +1192,27 @@ class BinaryQuantizedStore {
     const n    = entry.ids.length;
     const heap = new TopKHeap(limit);
 
+    const scoreAt = this._scorer(entry, col, query, metric);
+
+    for (let i = 0; i < n; i++) {
+      if (filter && !matchFilter(entry.meta[i], filter)) continue;
+      heap.push({ id: entry.ids[i], score: scoreAt(i, dims), metadata: entry.meta[i] });
+    }
+
+    return heap.sorted();
+  }
+
+  // Devuelve un scorer (idx, dims) -> score para `query`, según métrica/binario. Una sola decisión.
+  // Binario: cosine sobre bits. General: computeScore sobre el vector dequantizado.
+  _scorer(entry, col, query, metric) {
     if (metric === 'cosine' && entry.bin) {
       const qBin = BinaryQuantizedStore.quantize(query, this.dim);
       const u8   = new Uint8Array(entry.bin);
       const bpv  = this._bpv;
-      for (let i = 0; i < n; i++) {
-        if (filter && !matchFilter(entry.meta[i], filter)) continue;
-        const score = BinaryQuantizedStore.binaryCosineSim(qBin, 0, u8, i * bpv, dims);
-        heap.push({ id: entry.ids[i], score, metadata: entry.meta[i] });
-      }
-    } else {
-      const qNorm = normalize(query);
-      for (let i = 0; i < n; i++) {
-        if (filter && !matchFilter(entry.meta[i], filter)) continue;
-        const vec   = this._readVec(col, i);
-        const score = computeScore(qNorm, vec, dims, metric);
-        heap.push({ id: entry.ids[i], score, metadata: entry.meta[i] });
-      }
+      return (idx, dims) => BinaryQuantizedStore.binaryCosineSim(qBin, 0, u8, idx * bpv, dims);
     }
-
-    return heap.sorted();
+    const qNorm = normalize(query);
+    return (idx, dims) => computeScore(qNorm, this._readVec(col, idx), dims, metric);
   }
 
   matryoshkaSearch(col, query, limit = 5, stages = [128, 384, 768], metric = 'cosine') {
@@ -1108,11 +1221,7 @@ class BinaryQuantizedStore {
     if (entry.pending.length > 0) this._flushCol(col, entry);
 
     const factor = 4;
-    const useBinary = metric === 'cosine' && entry.bin;
-    const qBin  = useBinary ? BinaryQuantizedStore.quantize(query, this.dim) : null;
-    const qNorm = useBinary ? null : normalize(query);
-    const u8    = useBinary ? new Uint8Array(entry.bin) : null;
-    const bpv   = this._bpv;
+    const scoreAt = this._scorer(entry, col, query, metric);
 
     let candidates = entry.ids.map((id, i) => ({ id, idx: i, metadata: entry.meta[i] }));
 
@@ -1123,14 +1232,7 @@ class BinaryQuantizedStore {
       const heap = new TopKHeap(keepN);
 
       for (const c of candidates) {
-        let score;
-        if (useBinary) {
-          score = BinaryQuantizedStore.binaryCosineSim(qBin, 0, u8, c.idx * bpv, dims);
-        } else {
-          const vec = this._readVec(col, c.idx);
-          score = computeScore(qNorm, vec, dims, metric);
-        }
-        heap.push({ ...c, score });
+        heap.push({ ...c, score: scoreAt(c.idx, dims) });
       }
       candidates = heap.sorted();
     }
@@ -1600,35 +1702,52 @@ class IVFIndex {
     return centroids;
   }
 
+  // Índice del centroide más cercano al punto en `iOff` (distancia² euclídea). Desempata por el
+  // primer centroide con distancia estrictamente menor (igual que el original).
+  _nearestCentroid(flat, iOff, centroids, actualK, dim) {
+    let bestC = 0, bestD = Infinity;
+    for (let c = 0; c < actualK; c++) {
+      const d = euclideanDistSq(flat, iOff, centroids, c * dim, dim);
+      if (d < bestD) { bestD = d; bestC = c; }
+    }
+    return bestC;
+  }
+
+  // Paso de asignación de Lloyd: asigna cada punto a su centroide más cercano. Devuelve si cambió.
+  _assignStep(flat, n, dim, actualK, centroids, assignments) {
+    let changed = false;
+    for (let i = 0; i < n; i++) {
+      const bestC = this._nearestCentroid(flat, i * dim, centroids, actualK, dim);
+      if (assignments[i] !== bestC) { assignments[i] = bestC; changed = true; }
+    }
+    return changed;
+  }
+
+  // Paso de actualización: cada centroide = media de sus puntos asignados (in situ en `centroids`).
+  _updateCentroids(flat, n, dim, actualK, assignments, centroids) {
+    const sums   = new Float64Array(actualK * dim);
+    const counts = new Int32Array(actualK);
+    for (let i = 0; i < n; i++) {
+      const c = assignments[i];
+      counts[c]++;
+      const iOff = i * dim, cOff = c * dim;
+      for (let d = 0; d < dim; d++) sums[cOff + d] += flat[iOff + d];
+    }
+    for (let c = 0; c < actualK; c++) {
+      if (counts[c] === 0) continue;
+      const cOff = c * dim;
+      for (let d = 0; d < dim; d++) centroids[cOff + d] = sums[cOff + d] / counts[c];
+    }
+  }
+
   _kmeans(flat, n, dim, k, maxIter = 20) {
-    const actualK    = Math.min(k, n);
-    let centroids    = this._kmeansInit(flat, n, dim, actualK);
+    const actualK     = Math.min(k, n);
+    const centroids   = this._kmeansInit(flat, n, dim, actualK);
     const assignments = new Int32Array(n);
     for (let iter = 0; iter < maxIter; iter++) {
-      let changed = false;
-      for (let i = 0; i < n; i++) {
-        let bestC = 0, bestD = Infinity;
-        for (let c = 0; c < actualK; c++) {
-          const d = euclideanDistSq(flat, i * dim, centroids, c * dim, dim);
-          if (d < bestD) { bestD = d; bestC = c; }
-        }
-        if (assignments[i] !== bestC) { assignments[i] = bestC; changed = true; }
-      }
+      const changed = this._assignStep(flat, n, dim, actualK, centroids, assignments);
       if (!changed) break;
-      const sums   = new Float64Array(actualK * dim);
-      const counts = new Int32Array(actualK);
-      for (let i = 0; i < n; i++) {
-        const c = assignments[i];
-        counts[c]++;
-        const iOff = i * dim, cOff = c * dim;
-        for (let d = 0; d < dim; d++) sums[cOff + d] += flat[iOff + d];
-      }
-      for (let c = 0; c < actualK; c++) {
-        if (counts[c] > 0) {
-          const cOff = c * dim;
-          for (let d = 0; d < dim; d++) centroids[cOff + d] = sums[cOff + d] / counts[c];
-        }
-      }
+      this._updateCentroids(flat, n, dim, actualK, assignments, centroids);
     }
     const centroidArrays = [];
     for (let c = 0; c < actualK; c++) {
@@ -1637,25 +1756,19 @@ class IVFIndex {
     return { centroids: centroidArrays, assignments: Array.from(assignments) };
   }
 
-  build(col, sampleDims = 128) {
-    const entry = this.store._load(col);
-    const n     = entry.ids.length;
-    if (n === 0) throw new Error(`Colección vacía: ${col}`);
-    if (entry.pending && entry.pending.length > 0) this.store._flushCol(col, entry);
-
-    const dim = this.store.dim;
-    let flat;
-
+  // Dequantiza los `n` vectores de `col` a un Float64Array(n*dim) plano, según el tipo de store.
+  // Early-returns por tipo (evita el anidamiento del else-if); lógica idéntica al original.
+  _dequantizeFlat(col, entry, n, dim) {
+    const flat = new Float64Array(n * dim);
     if (this.store instanceof PolarQuantizedStore || this.store instanceof BinaryQuantizedStore) {
-      // Dequantizar a flat Float64Array (generico para cualquier quantized store)
-      flat = new Float64Array(n * dim);
       for (let i = 0; i < n; i++) {
         const vec = this.store._readVec(col, i);
         const iOff = i * dim;
         for (let d = 0; d < dim; d++) flat[iOff + d] = vec[d];
       }
-    } else if (this.store instanceof QuantizedStore) {
-      flat = new Float64Array(n * dim);
+      return flat;
+    }
+    if (this.store instanceof QuantizedStore) {
       const stride = this.store._stride;
       for (let i = 0; i < n; i++) {
         const offset = i * stride;
@@ -1669,11 +1782,21 @@ class IVFIndex {
           flat[iOff + d] = ((int8[d] + 128) / 255) * range + min;
         }
       }
-    } else {
-      flat = new Float64Array(n * dim);
-      const f32 = new Float32Array(entry.bin);
-      for (let i = 0; i < n * dim; i++) flat[i] = f32[i];
+      return flat;
     }
+    const f32 = new Float32Array(entry.bin);
+    for (let i = 0; i < n * dim; i++) flat[i] = f32[i];
+    return flat;
+  }
+
+  build(col, sampleDims = 128) {
+    const entry = this.store._load(col);
+    const n     = entry.ids.length;
+    if (n === 0) throw new Error(`Colección vacía: ${col}`);
+    if (entry.pending && entry.pending.length > 0) this.store._flushCol(col, entry);
+
+    const dim = this.store.dim;
+    const flat = this._dequantizeFlat(col, entry, n, dim);
 
     const { centroids, assignments } = this._kmeans(flat, n, dim, this.numClusters);
     const index = { centroids, assignments, sampleDims };
@@ -1821,13 +1944,8 @@ class CloudflareKVAdapter {
     do {
       const list = await this.kv.list({ prefix: this.prefix, cursor });
       for (const k of list.keys) {
-        if (this.prefix) {
-          if (k.name.startsWith(this.prefix)) {
-            result.push(k.name.slice(this.prefix.length));
-          }
-        } else {
-          result.push(k.name);
-        }
+        if (this.prefix && !k.name.startsWith(this.prefix)) continue;
+        result.push(this.prefix ? k.name.slice(this.prefix.length) : k.name);
       }
       cursor = list.list_complete ? undefined : list.cursor;
     } while (cursor);
@@ -2098,6 +2216,22 @@ class BM25Index {
 //   'rrf'      → Reciprocal Rank Fusion: score = sum(1/(k+rank)) por cada sistema
 //   'weighted' → Min-max normalize + weighted sum
 
+// Rango [min, max] (y su amplitud) de una secuencia de scores. Vacía -> Infinity/-Infinity
+// (igual que el original, para que normalizeScore devuelva 1.0 cuando range <= 0).
+function scoreRange(scores) {
+  let min = Infinity, max = -Infinity;
+  for (const s of scores) {
+    if (s < min) min = s;
+    if (s > max) max = s;
+  }
+  return { min, max, range: max - min };
+}
+
+// Normaliza `value` a [0,1] dentro de [min, min+range]; si range <= 0, 1.0 (igual que el original).
+function normalizeScore(value, min, range) {
+  return range > 0 ? (value - min) / range : 1.0;
+}
+
 class HybridSearch {
   /**
    * @param {VectorStore|QuantizedStore|BinaryQuantizedStore} store
@@ -2184,29 +2318,14 @@ class HybridSearch {
    * Weighted fusion con min-max normalization.
    */
   _fuseWeighted(vecResults, bm25Scores, limit, vectorWeight, textWeight) {
-    // Normalizar vector scores a [0,1]
-    let vecMin = Infinity, vecMax = -Infinity;
-    for (const r of vecResults) {
-      if (r.score < vecMin) vecMin = r.score;
-      if (r.score > vecMax) vecMax = r.score;
-    }
-    const vecRange = vecMax - vecMin;
-
-    // Normalizar BM25 scores a [0,1]
-    let bm25Min = Infinity, bm25Max = -Infinity;
-    for (const [, s] of bm25Scores) {
-      if (s < bm25Min) bm25Min = s;
-      if (s > bm25Max) bm25Max = s;
-    }
-    const bm25Range = bm25Max - bm25Min;
-
-    // Fusionar
+    const vec = scoreRange(vecResults.map(r => r.score));
+    const bm25 = scoreRange(Array.from(bm25Scores.values()));
     const fused = new Map();
 
     for (const r of vecResults) {
-      const normVec = vecRange > 0 ? (r.score - vecMin) / vecRange : 1.0;
+      const normVec = normalizeScore(r.score, vec.min, vec.range);
       const normBm25 = bm25Scores.has(r.id)
-        ? (bm25Range > 0 ? (bm25Scores.get(r.id) - bm25Min) / bm25Range : 1.0)
+        ? normalizeScore(bm25Scores.get(r.id), bm25.min, bm25.range)
         : 0;
       fused.set(r.id, {
         score: vectorWeight * normVec + textWeight * normBm25,
@@ -2216,10 +2335,9 @@ class HybridSearch {
 
     // Docs que estan en BM25 pero no en vector results
     for (const [id, bm25Score] of bm25Scores) {
-      if (!fused.has(id)) {
-        const normBm25 = bm25Range > 0 ? (bm25Score - bm25Min) / bm25Range : 1.0;
-        fused.set(id, { score: textWeight * normBm25, metadata: {} });
-      }
+      if (fused.has(id)) continue;
+      const normBm25 = normalizeScore(bm25Score, bm25.min, bm25.range);
+      fused.set(id, { score: textWeight * normBm25, metadata: {} });
     }
 
     const heap = new TopKHeap(limit);
@@ -2434,7 +2552,7 @@ class Reranker {
 // EXPORTS
 // ---------------------------------------------------------------------------
 
-module.exports = {
+const _api = {
   VectorStore,
   QuantizedStore,
   BinaryQuantizedStore,
@@ -2456,4 +2574,16 @@ module.exports = {
   manhattanDist,
   computeScore,
   matchFilter,
+  // Bundle portable (modelo "SQLite": un archivo, corre en browser/Worker/Node)
+  packBundle,
+  unpackBundle,
+  fetchBundle,
+  idbSaveBundle,
+  idbLoadBundle,
+  idbListBundles,
+  idbDeleteBundle,
 };
+
+// UMD-lite: CommonJS (Node / bundler) o, en browser/Worker sin módulos, global `JSVectorStore`.
+if (typeof module !== "undefined" && module.exports) module.exports = _api;
+else if (typeof globalThis !== "undefined") globalThis.JSVectorStore = _api;
