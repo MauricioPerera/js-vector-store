@@ -14,8 +14,13 @@ Port vanilla JS de [php-vector-store](https://github.com/MauricioPerera/php-vect
 - **4 metricas de distancia** — Cosine, Euclidean, DotProduct, Manhattan
 - **Matryoshka search** — busqueda multi-stage con slices dimensionales progresivos
 - **Cross-collection search** — con score normalization entre colecciones
-- Zero dependencias, 100% vanilla JS
+- **BM25 + HybridSearch** — búsqueda por keyword y fusión vector+texto (`rrf` / `weighted`)
+- **Filtros de metadata** — estilo Mongo (`$eq/$gt/$in/$and/$or/$regex/…`)
+- **Serverless / sin servidor** — serializá el índice a un solo archivo (`.jvs`) y consultalo en el
+  browser (IndexedDB), en un Cloudflare Worker (R2) o desde una URL — el modelo "SQLite para vectores"
+- Zero dependencias, 100% vanilla JS — corre en Node, browser (global `JSVectorStore`), Workers y Deno
 - Compatible con cualquier modelo de embeddings (OpenAI, Gemma, BGE, Cohere, etc.)
+- **88 tests offline** (`npm test`) + **benchmark reproducible** (`npm run bench`)
 
 ## Instalacion
 
@@ -43,12 +48,27 @@ const {
   MemoryStorageAdapter,
   FileStorageAdapter,
   CloudflareKVAdapter,
+  matchFilter,
+  // Bundle portable (serverless): un archivo, corre en browser/Worker/Node
+  fetchBundle,
+  idbSaveBundle,
+  idbLoadBundle,
   normalize,
   cosineSim,
   euclideanDist,
   computeScore,
   manhattanDist,
 } = require('js-vector-store');
+```
+
+En el **browser** (sin bundler) cargá el archivo con `<script src="js-vector-store.js">` y usá el
+global `JSVectorStore`:
+
+```html
+<script src="js-vector-store.js"></script>
+<script>
+  const { BinaryQuantizedStore, MemoryStorageAdapter } = JSVectorStore;
+</script>
 ```
 
 ## Quick Start
@@ -257,13 +277,19 @@ const store = new VectorStore(new FileStorageAdapter('./data/vectors'), 768);
 // Memoria (tests, browser)
 const store = new VectorStore(new MemoryStorageAdapter(), 768);
 
-// Cloudflare Workers KV
+// Cloudflare Workers KV — persist() solo escribe las keys modificadas (dirty/deleted tracking)
 const adapter = new CloudflareKVAdapter(env.MY_KV, 'vectors/');
 await adapter.preload(['docs.bin', 'docs.json']); // cargar al inicio del request
 const store = new VectorStore(adapter, 768);
 const results = store.search('docs', queryVec, 5);
 store.flush();
-await adapter.persist(); // escribir cambios a KV
+await adapter.persist(); // escribir cambios a KV (solo lo dirty; borra lo deleted)
+
+// FileStorageAdapter.listKeys() descubre colecciones en disco sin cargarlas antes
+new FileStorageAdapter('./data').listKeys(); // ['docs.b1.bin', 'docs.b1.json', ...]
+
+// maxCollections: limitar colecciones en memoria (0 = sin límite)
+const limited = new VectorStore(adapter, 768, 50); // 4º arg
 
 // Custom adapter (implementar esta interfaz):
 class MyAdapter {
@@ -274,6 +300,45 @@ class MyAdapter {
   delete(filename)           { /* void                 */ }
 }
 ```
+
+## Serverless: un archivo, corre en cualquier lado
+
+Modelo "SQLite para vectores": el índice vive en memoria, se serializa a UN `ArrayBuffer` (el
+"archivo" `.jvs`) y se persiste/carga sin servidor — en el browser, en un Cloudflare Worker o
+desde una URL. Como el store es **síncrono**, la persistencia es explícita y async (igual que sql.js).
+
+```js
+// 1) Construir en memoria (binario por memoria/velocidad en el edge)
+const adapter = new MemoryStorageAdapter();
+const store   = new BinaryQuantizedStore(adapter, 256);
+store.set('docs', 'id1', embedding, { tag: 'x' });
+store.flush('docs');
+
+// 2) Serializar TODO a un solo ArrayBuffer
+const bundle = adapter.toBundle();
+
+// 3a) Browser: persistir en IndexedDB
+await idbSaveBundle('mi-indice', bundle);
+const store2 = new BinaryQuantizedStore(
+  MemoryStorageAdapter.fromBundle(await idbLoadBundle('mi-indice')), 256);
+
+// 3b) Read-only desde una URL / CDN / R2 ("shippeás el .jvs")
+const remote = new BinaryQuantizedStore(
+  MemoryStorageAdapter.fromBundle(await fetchBundle('https://cdn.example.com/index.jvs')), 256);
+
+remote.search('docs', queryEmbedding, 5); // + filtros, BM25, híbrido
+```
+
+**Por qué binario en el edge:** un Cloudflare Worker tiene 128 MB → en binario (96 B/vector @768d)
+entran ~1M de vectores; en float32, ni 50k. Y es ~7-8x más rápido.
+
+| Ejemplo | Qué muestra |
+|---|---|
+| [`examples/browser/`](examples/browser/) | Demo client-side: build → bundle → IndexedDB → recargar → query |
+| [`examples/cloudflare-r2/`](examples/cloudflare-r2/) | Worker que sirve un índice `.jvs` desde R2 — alternativa de costo mínimo a Vectorize |
+
+API: `MemoryStorageAdapter.toBundle()` / `.fromBundle(ab)` · `fetchBundle(url)` ·
+`idbSaveBundle/idbLoadBundle/idbListBundles/idbDeleteBundle` · `packBundle/unpackBundle`.
 
 ### Math Utils
 
@@ -404,6 +469,13 @@ const top = ranked.slice(0, limit).map(r => candidates[r.index]);
 
 ## Benchmark
 
+Reproducible offline (sin embeddings ni red, vectores sintéticos):
+
+```bash
+npm run bench            # node benchmark-offline.js  (tamaños por defecto)
+npm run bench 1000 8000  # tamaños custom
+```
+
 Resultados con **EmbeddingGemma 300M** (768 dims) via Cloudflare Workers AI:
 
 ### Search (brute-force, Float32)
@@ -430,6 +502,10 @@ Resultados con **EmbeddingGemma 300M** (768 dims) via Cloudflare Workers AI:
 | K=100 P=10 | 7.1ms | **27.4x** |
 | K=50 P=10 | 13.6ms | **14.3x** |
 | K=50 P=5 | 26.6ms | **7.3x** |
+
+`IVFIndex.build` usa k-means++ con `dists` incremental (O(n·k·dim), antes O(n·k²·dim)) → build
+**~2.6–3.9x más rápido**, y `_getCandidates` usa listas invertidas por cluster (sin barrido O(n)
+por query). Mismos resultados, solo más rápido.
 
 ### Float32 vs Int8 (QuantizedStore)
 
@@ -465,10 +541,26 @@ Coleccion "articles"
 
 **Optimizaciones clave**:
 - Buffer binario cacheado en memoria — `_readVec` retorna views zero-copy (Float32Array subarray)
-- Escritura diferida — `set()` acumula en pending, `flush()` escribe una vez
+- Escritura diferida — `set()`/`remove()` marcan `dirty`, `flush()` escribe una vez
 - Map de IDs — lookup O(1) en vez de O(n)
 - Min-heap para top-K — O(n log k) en vez de O(n log n)
 - K-means sobre flat Float64Array contiguos — sin allocations por iteracion
+- K-means++ init con `dists` incremental — O(n·k·dim) en vez de O(n·k²·dim)
+- IVF con listas invertidas por cluster — la query no barre los N assignments
+
+## Tests
+
+Suite de correctitud **offline** (sin embeddings ni red) con el runner nativo de Node — cero
+dependencias:
+
+```bash
+npm test     # node --test "test/*.test.js"  — 88 tests
+```
+
+Cubre: math utils, `TopKHeap`, `matchFilter`, los 4 stores (CRUD + self-search + filtros +
+métricas), persistencia, `IVFIndex`, `BM25Index`, `HybridSearch`, los adapters (incl. dirty
+tracking de KV y `listKeys`), el bundle (round-trip + carga desde URL) y el Worker R2 (con KV
+mock). Ver [`test/README.md`](test/README.md).
 
 ## Ecosistema
 
@@ -488,8 +580,10 @@ Cada modulo es un solo archivo JS, zero dependencias, corre en Node/browser/Work
 | Modulo | Archivo | Que hace |
 |---|---|---|
 | **js-vector-server** | `server/` | REST API sobre Cloudflare Workers + KV |
+| **Demo browser** | `examples/browser/` | DB vectorial client-side (bundle + IndexedDB), sin servidor |
+| **Worker + R2** | `examples/cloudflare-r2/` | Búsqueda read-only desde un índice `.jvs` en R2 (alt. a Vectorize) |
 
-- [Documentacion server](server/README.md)
+- [Documentacion server](server/README.md) · [Serverless / browser](examples/browser/README.md) · [Worker + R2](examples/cloudflare-r2/README.md)
 
 ## Creditos
 
