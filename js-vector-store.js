@@ -1577,18 +1577,14 @@ class IVFIndex {
     const centroids = new Float64Array(k * dim);
     const first = Math.floor(Math.random() * n);
     for (let d = 0; d < dim; d++) centroids[d] = flat[first * dim + d];
+    // dists[i] = distancia² mínima de i a los centroides ya elegidos. Se mantiene INCREMENTALMENTE
+    // (min con el nuevo centroide) en O(n·k·dim) en vez de recomputar todo en O(n·k²·dim).
+    // Mismos valores y mismo orden de Math.random que la versión que recomputaba -> idéntico.
     const dists = new Float64Array(n);
+    for (let i = 0; i < n; i++) dists[i] = euclideanDistSq(flat, i * dim, centroids, 0, dim);
     for (let c = 1; c < k; c++) {
       let total = 0;
-      for (let i = 0; i < n; i++) {
-        let minD = Infinity;
-        for (let cc = 0; cc < c; cc++) {
-          const distSq = euclideanDistSq(flat, i * dim, centroids, cc * dim, dim);
-          if (distSq < minD) minD = distSq;
-        }
-        dists[i] = minD;
-        total += minD;
-      }
+      for (let i = 0; i < n; i++) total += dists[i];
       let r = Math.random() * total;
       let chosen = 0;
       for (let i = 0; i < n; i++) {
@@ -1596,6 +1592,10 @@ class IVFIndex {
         if (r <= 0) { chosen = i; break; }
       }
       for (let d = 0; d < dim; d++) centroids[c * dim + d] = flat[chosen * dim + d];
+      for (let i = 0; i < n; i++) {
+        const d2 = euclideanDistSq(flat, i * dim, centroids, c * dim, dim);
+        if (d2 < dists[i]) dists[i] = d2;
+      }
     }
     return centroids;
   }
