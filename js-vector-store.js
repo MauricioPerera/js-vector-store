@@ -1069,26 +1069,27 @@ class BinaryQuantizedStore {
     const n    = entry.ids.length;
     const heap = new TopKHeap(limit);
 
+    const scoreAt = this._scorer(entry, col, query, metric);
+
+    for (let i = 0; i < n; i++) {
+      if (filter && !matchFilter(entry.meta[i], filter)) continue;
+      heap.push({ id: entry.ids[i], score: scoreAt(i, dims), metadata: entry.meta[i] });
+    }
+
+    return heap.sorted();
+  }
+
+  // Devuelve un scorer (idx, dims) -> score para `query`, según métrica/binario. Una sola decisión.
+  // Binario: cosine sobre bits. General: computeScore sobre el vector dequantizado.
+  _scorer(entry, col, query, metric) {
     if (metric === 'cosine' && entry.bin) {
       const qBin = BinaryQuantizedStore.quantize(query, this.dim);
       const u8   = new Uint8Array(entry.bin);
       const bpv  = this._bpv;
-      for (let i = 0; i < n; i++) {
-        if (filter && !matchFilter(entry.meta[i], filter)) continue;
-        const score = BinaryQuantizedStore.binaryCosineSim(qBin, 0, u8, i * bpv, dims);
-        heap.push({ id: entry.ids[i], score, metadata: entry.meta[i] });
-      }
-    } else {
-      const qNorm = normalize(query);
-      for (let i = 0; i < n; i++) {
-        if (filter && !matchFilter(entry.meta[i], filter)) continue;
-        const vec   = this._readVec(col, i);
-        const score = computeScore(qNorm, vec, dims, metric);
-        heap.push({ id: entry.ids[i], score, metadata: entry.meta[i] });
-      }
+      return (idx, dims) => BinaryQuantizedStore.binaryCosineSim(qBin, 0, u8, idx * bpv, dims);
     }
-
-    return heap.sorted();
+    const qNorm = normalize(query);
+    return (idx, dims) => computeScore(qNorm, this._readVec(col, idx), dims, metric);
   }
 
   matryoshkaSearch(col, query, limit = 5, stages = [128, 384, 768], metric = 'cosine') {
@@ -1097,11 +1098,7 @@ class BinaryQuantizedStore {
     if (entry.pending.length > 0) this._flushCol(col, entry);
 
     const factor = 4;
-    const useBinary = metric === 'cosine' && entry.bin;
-    const qBin  = useBinary ? BinaryQuantizedStore.quantize(query, this.dim) : null;
-    const qNorm = useBinary ? null : normalize(query);
-    const u8    = useBinary ? new Uint8Array(entry.bin) : null;
-    const bpv   = this._bpv;
+    const scoreAt = this._scorer(entry, col, query, metric);
 
     let candidates = entry.ids.map((id, i) => ({ id, idx: i, metadata: entry.meta[i] }));
 
@@ -1112,14 +1109,7 @@ class BinaryQuantizedStore {
       const heap = new TopKHeap(keepN);
 
       for (const c of candidates) {
-        let score;
-        if (useBinary) {
-          score = BinaryQuantizedStore.binaryCosineSim(qBin, 0, u8, c.idx * bpv, dims);
-        } else {
-          const vec = this._readVec(col, c.idx);
-          score = computeScore(qNorm, vec, dims, metric);
-        }
-        heap.push({ ...c, score });
+        heap.push({ ...c, score: scoreAt(c.idx, dims) });
       }
       candidates = heap.sorted();
     }
