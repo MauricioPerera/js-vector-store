@@ -1703,19 +1703,33 @@ class IVFIndex {
     return { numClusters: idx.centroids.length, numProbes: this.numProbes };
   }
 
+  // Lista invertida cluster -> índices de sus miembros, calculada UNA vez y cacheada en el índice.
+  // Evita el barrido O(n) de assignments en cada query.
+  _clusterMembers(idx) {
+    if (idx._members) return idx._members;
+    const members = Array.from({ length: idx.centroids.length }, () => []);
+    const a = idx.assignments;
+    for (let i = 0; i < a.length; i++) members[a[i]].push(i);
+    idx._members = members;
+    return members;
+  }
+
   _getCandidates(col, query) {
     const idx  = this._loadIndex(col);
     if (!idx) throw new Error(`No hay índice IVF para: ${col}. Llamá a .build() primero.`);
-    const { centroids, assignments } = idx;
+    const { centroids } = idx;
     const dims = idx.sampleDims ?? query.length;
     const centDists = centroids.map((c, i) => ({ i, d: euclideanDist(query, c, dims) }));
     centDists.sort((a, b) => a.d - b.d);
-    const probeClusters = new Set(centDists.slice(0, this.numProbes).map(x => x.i));
+    const probeClusters = centDists.slice(0, this.numProbes).map(x => x.i);
+    const members = this._clusterMembers(idx);
     const entry = this.store._load(col);
     const candidateIdxs = [];
-    for (let i = 0; i < assignments.length; i++) {
-      if (probeClusters.has(assignments[i])) candidateIdxs.push(i);
+    for (const cluster of probeClusters) {
+      const m = members[cluster];
+      for (let j = 0; j < m.length; j++) candidateIdxs.push(m[j]);
     }
+    candidateIdxs.sort((a, b) => a - b); // mismo orden que el barrido original (equivalencia exacta)
     return { entry, candidateIdxs };
   }
 
