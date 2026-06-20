@@ -6,6 +6,9 @@
   "exports": {
     ".": "./js-vector-store.js"
   },
+  "scripts": {
+    "test": "node --test \"test/*.test.js\""
+  },
   "keywords": [
     "vector-store",
     "vector-database",
