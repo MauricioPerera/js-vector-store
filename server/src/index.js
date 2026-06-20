@@ -109,7 +109,6 @@ export default {
         return err('Unauthorized', 401);
       }
     }
-    const { parts } = parseRoute(request.url);
     const storeType = (env.STORE_TYPE || 'binary').toLowerCase();
     const dim = parseInt(env.DIMENSIONS || '768', 10);
     const prefix = '';
